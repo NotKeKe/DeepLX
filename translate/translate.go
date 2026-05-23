@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -34,6 +35,8 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/imroc/req/v3"
 	"github.com/tidwall/gjson"
+
+	"github.com/OwO-Network/DeepLX/proxy"
 )
 
 // DeepL's interactive web translator migrated to a SignalR/WebSocket
@@ -310,12 +313,10 @@ func newOneshotClient(proxyURL string) (*req.Client, error) {
 	} {
 		client.Headers.Del(h)
 	}
-	// Chrome 120 fetch() advertises gzip/deflate/br (zstd only appeared
-	// as a default in Chrome 123+). req's default of just "gzip" is a
-	// distinguishable signal — match Chrome explicitly.
 	client.SetCommonHeader("Accept-Encoding", "gzip, deflate, br")
 
 	if proxyURL != "" {
+		proxyURL = convertToRemoteDNS(proxyURL)
 		u, err := url.Parse(proxyURL)
 		if err != nil {
 			return nil, err
@@ -325,68 +326,95 @@ func newOneshotClient(proxyURL string) (*req.Client, error) {
 	return client, nil
 }
 
+func convertToRemoteDNS(proxyURL string) string {
+	proxyURL = strings.Replace(proxyURL, "socks5://", "socks5h://", 1)
+	proxyURL = strings.Replace(proxyURL, "socks4://", "socks4a://", 1)
+	proxyURL = strings.Replace(proxyURL, "http://", "http://", 1)
+	return proxyURL
+}
+
 // callOneshot POSTs to the oneshot endpoint and returns the parsed JSON.
 // For anonymous traffic bearerToken is empty and we send the literal
 // header `Authorization: None` — replicating the extension's JO() wrapper
 // exactly. Omitting that header instead would put the request on a
 // different server-side auth branch.
-func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gjson.Result, int, error) {
-	client, err := getOneshotClient(proxyURL)
-	if err != nil {
-		return gjson.Result{}, 0, err
-	}
+func callOneshot(endpoint string, body []byte, bearerToken string, pool *proxy.ProxyPool) (gjson.Result, int, error) {
+	var lastErr error
+	maxRetries := 3
 
-	authValue := "None"
-	if bearerToken != "" {
-		authValue = "Bearer " + bearerToken
-	}
-
-	resp, err := client.R().
-		DisableAutoReadResponse().
-		SetHeader("Content-Type", "application/json").
-		SetHeader("Accept", "*/*").
-		SetHeader("Authorization", authValue).
-		SetHeader("Origin", "chrome-extension://"+chromeExtensionID).
-		SetHeader("Sec-Fetch-Site", "cross-site").
-		SetHeader("Sec-Fetch-Mode", "cors").
-		SetHeader("Sec-Fetch-Dest", "empty").
-		SetBodyBytes(body). // SetBodyBytes pins Content-Length; using an
-		// io.Reader instead forces Transfer-Encoding: chunked, which a
-		// real fetch() with JSON.stringify body never emits.
-		Post(endpoint)
-	if err != nil {
-		return gjson.Result{}, 0, err
-	}
-	defer resp.Body.Close()
-
-	// Once we set Accept-Encoding ourselves, Go's HTTP stack stops
-	// transparently decompressing, so handle gzip/deflate/br by hand.
-	var reader io.Reader = resp.Body
-	switch strings.ToLower(resp.Header.Get("Content-Encoding")) {
-	case "gzip":
-		gr, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return gjson.Result{}, resp.StatusCode, fmt.Errorf("gzip reader: %w", err)
+	for i := 0; i < maxRetries; i++ {
+		proxyInfo := pool.GetNextProxy()
+		if proxyInfo == nil {
+			return gjson.Result{}, 0, fmt.Errorf("no available proxies")
 		}
-		defer gr.Close()
-		reader = gr
-	case "deflate":
-		reader = flate.NewReader(resp.Body)
-	case "br":
-		reader = brotli.NewReader(resp.Body)
+
+		proxyURL := proxyInfo.URL
+		log.Printf("[Proxy] Using: %s (latency: %dms)", proxyURL, proxyInfo.LatencyMs)
+		client, err := getOneshotClient(proxyURL)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		authValue := "None"
+		if bearerToken != "" {
+			authValue = "Bearer " + bearerToken
+		}
+
+		resp, err := client.R().
+			DisableAutoReadResponse().
+			SetHeader("Content-Type", "application/json").
+			SetHeader("Accept", "*/*").
+			SetHeader("Authorization", authValue).
+			SetHeader("Origin", "chrome-extension://"+chromeExtensionID).
+			SetHeader("Sec-Fetch-Site", "cross-site").
+			SetHeader("Sec-Fetch-Mode", "cors").
+			SetHeader("Sec-Fetch-Dest", "empty").
+			SetBodyBytes(body).
+			Post(endpoint)
+		if err != nil {
+			pool.MarkFailed(proxyURL, "request_error")
+			lastErr = err
+			continue
+		}
+		defer resp.Body.Close()
+
+		var reader io.Reader = resp.Body
+		switch strings.ToLower(resp.Header.Get("Content-Encoding")) {
+		case "gzip":
+			gr, err := gzip.NewReader(resp.Body)
+			if err != nil {
+				return gjson.Result{}, resp.StatusCode, fmt.Errorf("gzip reader: %w", err)
+			}
+			defer gr.Close()
+			reader = gr
+		case "deflate":
+			reader = flate.NewReader(resp.Body)
+		case "br":
+			reader = brotli.NewReader(resp.Body)
+		}
+		raw, err := io.ReadAll(reader)
+		if err != nil {
+			return gjson.Result{}, resp.StatusCode, fmt.Errorf("read response body: %w", err)
+		}
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			pool.MarkFailed(proxyURL, "rate_limit")
+			lastErr = fmt.Errorf("rate limit (429)")
+			continue
+		}
+
+		return gjson.ParseBytes(raw), resp.StatusCode, nil
 	}
-	raw, err := io.ReadAll(reader)
-	if err != nil {
-		return gjson.Result{}, resp.StatusCode, fmt.Errorf("read response body: %w", err)
-	}
-	return gjson.ParseBytes(raw), resp.StatusCode, nil
+
+	return gjson.Result{}, 0, fmt.Errorf("all proxies failed after %d retries, last error: %w", maxRetries, lastErr)
 }
 
 // TranslateByDeepLX performs translation via the DeepL oneshot endpoint.
 // Passing dlSession switches to the Pro endpoint; the value is sent
 // verbatim as the Bearer token (i.e. it must be an OAuth access token,
 // not the legacy dl_session cookie).
-func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, proxyURL string, dlSession string) (DeepLXTranslationResult, error) {
+func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, pool *proxy.ProxyPool, dlSession string) (DeepLXTranslationResult, error) {
 	if text == "" {
 		return DeepLXTranslationResult{
 			Code:    http.StatusNotFound,
@@ -419,7 +447,7 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 	reqStruct := oneshotRequest{
 		Text:       []string{text},
 		TargetLang: resolvedTarget,
-		SourceLang: resolvedSource, // empty = autodetect; omitempty drops the field
+		SourceLang: resolvedSource,
 		UsageType:  "Translate",
 		AppInformation: appInformation{
 			OS:         "brex_macOS",
@@ -437,10 +465,8 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 	}
 
 	id := time.Now().UnixMilli()
-	result, status, err := callOneshot(endpoint, bodyBytes, dlSession, proxyURL)
+	result, status, err := callOneshot(endpoint, bodyBytes, dlSession, pool)
 	if err != nil {
-		// Map upstream timeouts to 504 so callers can distinguish "DeepL
-		// took too long" from other 503 failure modes (DNS, TLS, etc.).
 		var ue *url.Error
 		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ue) && ue.Timeout()) {
 			return DeepLXTranslationResult{
@@ -458,7 +484,6 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 
 	switch status {
 	case http.StatusOK:
-		// fall through to body parsing
 	case http.StatusTooManyRequests:
 		return DeepLXTranslationResult{
 			ID:      id,
@@ -499,7 +524,7 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 		Code:         http.StatusOK,
 		ID:           id,
 		Data:         mainText,
-		Alternatives: nil, // oneshot does not return alternatives
+		Alternatives: nil,
 		SourceLang:   sourceLang,
 		TargetLang:   targetLang,
 		Method:       map[bool]string{true: "Pro", false: "Free"}[dlSession != ""],

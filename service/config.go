@@ -16,14 +16,20 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"github.com/OwO-Network/DeepLX/proxy"
 )
 
 type Config struct {
-	IP        string
-	Port      int
-	Token     string
-	DlSession string
-	Proxy     string
+	IP               string
+	Port             int
+	Token            string
+	DlSession        string
+	Proxy            string
+	ProxyListURL     string
+	UpdateInterval   int
+	LatencyTimeout   int
+	ProxyPool        *proxy.ProxyPool
 }
 
 func InitConfig() *Config {
@@ -69,6 +75,30 @@ func InitConfig() *Config {
 			cfg.Proxy = proxy
 		}
 	}
+
+	// Proxy List URL flag
+	flag.StringVar(&cfg.ProxyListURL, "proxy-list-url", "", "set the URL to fetch proxy list from")
+	if cfg.ProxyListURL == "" {
+		if proxyListURL, ok := os.LookupEnv("PROXY_LIST_URL"); ok {
+			cfg.ProxyListURL = proxyListURL
+		}
+	}
+
+	// Proxy Update Interval flag
+	if updateInterval, ok := os.LookupEnv("PROXY_UPDATE_INTERVAL"); ok && updateInterval != "" {
+		fmt.Sscanf(updateInterval, "%d", &cfg.UpdateInterval)
+	} else {
+		cfg.UpdateInterval = 5
+	}
+	flag.IntVar(&cfg.UpdateInterval, "proxy-update-interval", cfg.UpdateInterval, "set the interval in minutes to update proxy list")
+
+	// Latency Timeout flag
+	if latencyTimeout, ok := os.LookupEnv("PROXY_LATENCY_TIMEOUT"); ok && latencyTimeout != "" {
+		fmt.Sscanf(latencyTimeout, "%d", &cfg.LatencyTimeout)
+	} else {
+		cfg.LatencyTimeout = 3
+	}
+	flag.IntVar(&cfg.LatencyTimeout, "proxy-latency-timeout", cfg.LatencyTimeout, "set the latency timeout in seconds")
 
 	flag.Parse()
 	return cfg

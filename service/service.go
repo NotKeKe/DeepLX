@@ -16,8 +16,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
-	"os"
 	"strings"
 
 	"github.com/gin-contrib/cors"
@@ -75,21 +73,6 @@ type PayloadAPI struct {
 }
 
 func Router(cfg *Config) *gin.Engine {
-	// Set Proxy
-	proxyURL := os.Getenv("PROXY")
-	if proxyURL == "" {
-		proxyURL = cfg.Proxy
-	}
-	if proxyURL != "" {
-		proxy, err := url.Parse(proxyURL)
-		if err != nil {
-			log.Fatalf("Failed to parse proxy URL: %v", err)
-		}
-		http.DefaultTransport = &http.Transport{
-			Proxy: http.ProxyURL(proxy),
-		}
-	}
-
 	if cfg.Token != "" {
 		fmt.Println("Access token is set.")
 	}
@@ -115,8 +98,6 @@ func Router(cfg *Config) *gin.Engine {
 		translateText := req.TransText
 		tagHandling := req.TagHandling
 
-		proxyURL := cfg.Proxy
-
 		if tagHandling != "" && tagHandling != "html" && tagHandling != "xml" {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"code":    http.StatusBadRequest,
@@ -125,7 +106,7 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, "")
+		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, cfg.ProxyPool, "")
 		if err != nil {
 			log.Fatalf("Translation failed: %s", err)
 		}
@@ -158,7 +139,6 @@ func Router(cfg *Config) *gin.Engine {
 		targetLang := req.TargetLang
 		translateText := req.TransText
 		tagHandling := req.TagHandling
-		proxyURL := cfg.Proxy
 
 		dlSession := cfg.DlSession
 
@@ -189,7 +169,7 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, dlSession)
+		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, cfg.ProxyPool, dlSession)
 		if err != nil {
 			log.Fatalf("Translation failed: %s", err)
 		}
@@ -215,8 +195,6 @@ func Router(cfg *Config) *gin.Engine {
 
 	// Free API endpoint, Consistent with the official API format
 	r.POST("/v2/translate", authMiddleware(cfg), func(c *gin.Context) {
-		proxyURL := cfg.Proxy
-
 		var translateText string
 		var targetLang string
 
@@ -241,7 +219,7 @@ func Router(cfg *Config) *gin.Engine {
 			targetLang = jsonData.TargetLang
 		}
 
-		result, err := translate.TranslateByDeepLX("", targetLang, translateText, "", proxyURL, "")
+		result, err := translate.TranslateByDeepLX("", targetLang, translateText, "", cfg.ProxyPool, "")
 		if err != nil {
 			log.Fatalf("Translation failed: %s", err)
 		}

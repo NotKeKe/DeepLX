@@ -17,16 +17,27 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/OwO-Network/DeepLX/proxy"
 	"github.com/OwO-Network/DeepLX/service"
 )
 
 func main() {
 	cfg := service.InitConfig()
 
+	if cfg.ProxyListURL != "" {
+		pool := proxy.NewProxyPool(cfg.ProxyListURL, cfg.UpdateInterval, cfg.LatencyTimeout)
+		pool.Start()
+		cfg.ProxyPool = pool
+	} else if cfg.Proxy != "" {
+		pool := proxy.NewSingleProxyPool(cfg.Proxy, cfg.LatencyTimeout)
+		cfg.ProxyPool = pool
+	} else {
+		cfg.ProxyPool = proxy.NewEmptyProxyPool()
+	}
+
 	fmt.Printf("DeepL X has been successfully launched! Listening on %v:%v\n", cfg.IP, cfg.Port)
 	fmt.Println("Developed by sjlleo <i@leo.moe> and missuo <me@missuo.me>.")
 
-	// Setting the application to release mode
 	gin.SetMode(gin.ReleaseMode)
 
 	app := service.Router(cfg)
