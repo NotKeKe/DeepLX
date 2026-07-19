@@ -3,7 +3,7 @@
  * @Date: 2023-07-01 21:45:34
  * @LastEditors: Jason Lyu
  * @LastEditTime: 2025-04-08 13:45:00
- * @FilePath: /DeepLX/main.go
+ * @FilePath: /DLX/service/service.go
  * @Telegram: https://t.me/missuo
  * @GitHub: https://github.com/missuo
  *
@@ -21,7 +21,7 @@ import (
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 
-	"github.com/OwO-Network/DeepLX/translate"
+	"github.com/OwO-Network/DLX/translate"
 )
 
 func authMiddleware(cfg *Config) gin.HandlerFunc {
@@ -84,14 +84,20 @@ func Router(cfg *Config) *gin.Engine {
 	r.GET("/", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"code":    http.StatusOK,
-			"message": "DeepL Free API, Developed by sjlleo and missuo. Go to /translate with POST. http://github.com/OwO-Network/DeepLX",
+			"message": "DLX Translation API, Developed by sjlleo and missuo. Go to /translate with POST. https://github.com/OwO-Network/DLX",
 		})
 	})
 
 	// Free API endpoint, No Pro Account required
 	r.POST("/translate", authMiddleware(cfg), func(c *gin.Context) {
 		req := PayloadFree{}
-		c.BindJSON(&req)
+		if err := c.BindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":    http.StatusBadRequest,
+				"message": "Invalid request payload",
+			})
+			return
+		}
 
 		sourceLang := req.SourceLang
 		targetLang := req.TargetLang
@@ -108,7 +114,12 @@ func Router(cfg *Config) *gin.Engine {
 
 		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, cfg.ProxyPool, "")
 		if err != nil {
-			log.Fatalf("Translation failed: %s", err)
+			log.Printf("Translation failed: %s", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"code":    http.StatusInternalServerError,
+				"message": "Translation failed",
+			})
+			return
 		}
 
 		if result.Code == http.StatusOK {
@@ -133,7 +144,13 @@ func Router(cfg *Config) *gin.Engine {
 	// Pro API endpoint, Pro Account required
 	r.POST("/v1/translate", authMiddleware(cfg), func(c *gin.Context) {
 		req := PayloadFree{}
-		c.BindJSON(&req)
+		if err := c.BindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":    http.StatusBadRequest,
+				"message": "Invalid request payload",
+			})
+			return
+		}
 
 		sourceLang := req.SourceLang
 		targetLang := req.TargetLang
@@ -171,7 +188,12 @@ func Router(cfg *Config) *gin.Engine {
 
 		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, cfg.ProxyPool, dlSession)
 		if err != nil {
-			log.Fatalf("Translation failed: %s", err)
+			log.Printf("Translation failed: %s", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"code":    http.StatusInternalServerError,
+				"message": "Translation failed",
+			})
+			return
 		}
 
 		if result.Code == http.StatusOK {
@@ -221,7 +243,12 @@ func Router(cfg *Config) *gin.Engine {
 
 		result, err := translate.TranslateByDeepLX("", targetLang, translateText, "", cfg.ProxyPool, "")
 		if err != nil {
-			log.Fatalf("Translation failed: %s", err)
+			log.Printf("Translation failed: %s", err)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"code":    http.StatusInternalServerError,
+				"message": "Translation failed",
+			})
+			return
 		}
 
 		if result.Code == http.StatusOK {

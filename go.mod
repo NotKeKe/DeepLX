@@ -1,4 +1,4 @@
-module github.com/OwO-Network/DeepLX
+module github.com/OwO-Network/DLX
 
 go 1.25.0
 

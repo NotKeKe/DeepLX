@@ -3,7 +3,7 @@
  * @Date: 2024-04-23 00:39:03
  * @LastEditors: Jason Lyu
  * @LastEditTime: 2025-04-08 13:45:00
- * @FilePath: /DeepLX/config.go
+ * @FilePath: /DLX/service/config.go
  * @Telegram: https://t.me/missuo
  * @GitHub: https://github.com/missuo
  *

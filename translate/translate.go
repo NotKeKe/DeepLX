@@ -3,7 +3,7 @@
  * @Date: 2024-09-16 11:59:24
  * @LastEditors: Vincent Yang
  * @LastEditTime: 2026-05-22 00:00:00
- * @FilePath: /DeepLX/translate/translate.go
+ * @FilePath: /DLX/translate/translate.go
  * @Telegram: https://t.me/missuo
  * @GitHub: https://github.com/missuo
  *
@@ -410,13 +410,13 @@ func callOneshot(endpoint string, body []byte, bearerToken string, pool *proxy.P
 	return gjson.Result{}, 0, fmt.Errorf("all proxies failed after %d retries, last error: %w", maxRetries, lastErr)
 }
 
-// TranslateByDeepLX performs translation via the DeepL oneshot endpoint.
+// TranslateByDLX performs translation via the DeepL oneshot endpoint.
 // Passing dlSession switches to the Pro endpoint; the value is sent
 // verbatim as the Bearer token (i.e. it must be an OAuth access token,
 // not the legacy dl_session cookie).
 func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, pool *proxy.ProxyPool, dlSession string) (DeepLXTranslationResult, error) {
 	if text == "" {
-		return DeepLXTranslationResult{
+		return DLXTranslationResult{
 			Code:    http.StatusNotFound,
 			Message: "No text to translate",
 		}, nil
@@ -424,21 +424,21 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 
 	resolvedTarget, err := resolveTargetLang(targetLang)
 	if err != nil {
-		return DeepLXTranslationResult{
+		return DLXTranslationResult{
 			Code:    http.StatusBadRequest,
 			Message: err.Error(),
 		}, nil
 	}
 	resolvedSource, err := resolveSourceLang(sourceLang)
 	if err != nil {
-		return DeepLXTranslationResult{
+		return DLXTranslationResult{
 			Code:    http.StatusBadRequest,
 			Message: err.Error(),
 		}, nil
 	}
 
 	if n := utf8.RuneCountInString(text); n > maxFreeTextLength {
-		return DeepLXTranslationResult{
+		return DLXTranslationResult{
 			Code:    http.StatusRequestEntityTooLarge,
 			Message: fmt.Sprintf("text exceeds maximum length: %d characters (anonymous oneshot limit is %d)", n, maxFreeTextLength),
 		}, nil
@@ -469,13 +469,13 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 	if err != nil {
 		var ue *url.Error
 		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ue) && ue.Timeout()) {
-			return DeepLXTranslationResult{
+			return DLXTranslationResult{
 				ID:      id,
 				Code:    http.StatusGatewayTimeout,
 				Message: fmt.Sprintf("upstream DeepL request timed out after %s", oneshotTimeout),
 			}, nil
 		}
-		return DeepLXTranslationResult{
+		return DLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
 			Message: err.Error(),
@@ -485,13 +485,13 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 	switch status {
 	case http.StatusOK:
 	case http.StatusTooManyRequests:
-		return DeepLXTranslationResult{
+		return DLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusTooManyRequests,
 			Message: "too many requests, your IP has been blocked by DeepL temporarily, please don't request it frequently in a short time",
 		}, nil
 	default:
-		return DeepLXTranslationResult{
+		return DLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
 			Message: fmt.Sprintf("request failed with status code: %d", status),
@@ -500,7 +500,7 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 
 	translations := result.Get("translations").Array()
 	if len(translations) == 0 {
-		return DeepLXTranslationResult{
+		return DLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
 			Message: "Translation failed",
@@ -509,7 +509,7 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 
 	mainText := translations[0].Get("text").String()
 	if mainText == "" {
-		return DeepLXTranslationResult{
+		return DLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
 			Message: "Translation failed",
@@ -520,7 +520,7 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 		sourceLang = strings.ToUpper(detected)
 	}
 
-	return DeepLXTranslationResult{
+	return DLXTranslationResult{
 		Code:         http.StatusOK,
 		ID:           id,
 		Data:         mainText,

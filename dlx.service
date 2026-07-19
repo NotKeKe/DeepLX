@@ -1,12 +1,12 @@
 [Unit]
-Description=DeepLX Service
+Description=DLX Service
 After=network.target
 
 [Service]
 Type=simple
 Restart=always
 WorkingDirectory=/usr/bin/
-ExecStart=/usr/bin/deeplx
+ExecStart=/usr/bin/dlx
 
 [Install]
 WantedBy=multi-user.target
