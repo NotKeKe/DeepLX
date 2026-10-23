@@ -74,6 +74,28 @@ func TestTranslateBaseURLCompatibility(t *testing.T) {
 	}
 }
 
+// A bare POST to the root is what a base-URL client sends as a connectivity
+// probe. It must be 200, not 404 or 400, while a real translate payload still
+// goes through the normal handler (covered above).
+func TestPostRootProbeReturnsOK(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := Router(&Config{})
+
+	for _, body := range []string{"", "{}", "ping", `{"foo":"bar"}`} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("POST / body=%q = %d %s, want 200", body, recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), `"message":"OK"`) {
+			t.Fatalf("POST / body=%q = %s, want a 200 OK message", body, recorder.Body.String())
+		}
+	}
+}
+
 // POST /translate mirrors the shape it was given, and no shape that carries
 // text is an error any more — an empty text is answered with itself and an
 // empty array with an empty array. Every case here is answered (or refused)

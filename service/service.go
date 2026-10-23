@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -120,6 +121,38 @@ func (p *PayloadText) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// rootPostHandler makes POST / a compatibility endpoint for clients that are
+// configured with only the server base URL. A body that names a text is
+// translated exactly like POST /translate. Anything else — an empty body, an
+// empty object, or a plain connectivity probe — is answered 200 instead of
+// 404/400, so a client's "test service" check succeeds.
+func rootPostHandler(translateHandler gin.HandlerFunc) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		raw, err := io.ReadAll(c.Request.Body)
+		if err != nil {
+			c.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "message": "OK"})
+			return
+		}
+		body := bytes.TrimSpace(raw)
+		if len(body) == 0 {
+			c.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "message": "OK"})
+			return
+		}
+
+		var probe struct {
+			Text json.RawMessage `json:"text"`
+		}
+		if err := json.Unmarshal(body, &probe); err != nil || len(probe.Text) == 0 {
+			c.JSON(http.StatusOK, gin.H{"code": http.StatusOK, "message": "OK"})
+			return
+		}
+
+		// Hand the body back to the regular handler, which binds it itself.
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		translateHandler(c)
+	}
+}
+
 func Router(cfg *Config) *gin.Engine {
 	if cfg.Token != "" {
 		fmt.Println("Access token is set.")
@@ -211,9 +244,9 @@ func Router(cfg *Config) *gin.Engine {
 	r.POST("/translate", translateAuth, translateHandler)
 	// Compatibility alias: some DeepLX clients, including Immersive
 	// Translate's DeepLX integration, are configured with only the server base
-	// URL and therefore POST to "/". Treat that as POST /translate instead of
-	// answering 404.
-	r.POST("/", translateAuth, translateHandler)
+	// URL and therefore POST to "/". A translate payload is handled as
+	// POST /translate; a bare probe is answered 200 rather than 404.
+	r.POST("/", translateAuth, rootPostHandler(translateHandler))
 
 	// Pro API endpoint, Pro Account required
 	r.POST("/v1/translate", authMiddleware(cfg), func(c *gin.Context) {
