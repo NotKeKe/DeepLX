@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/andybalholm/brotli"
@@ -84,7 +85,7 @@ const (
 	// ("your IP has been blocked by DeepL temporarily"), from any IP. The build
 	// number stays pinned because Apple's lookup API does not expose
 	// CFBundleVersion.
-	iosAppVersion = "26.52"
+	iosAppVersion = "26.55"
 	iosAppBuild   = "5443737"
 
 	// Reported OS version for app_information.os_version + x-app-os-version.
@@ -136,9 +137,23 @@ var (
 	cookieWarmer  sync.Once
 )
 
-// oneshotClients caches one req.Client per proxy URL so all translate
-// calls share the underlying TCP / TLS / HTTP/2 connection pool.
-var oneshotClients sync.Map // map[string]*req.Client
+// oneshotClients caches one req.Client per proxy URL and TLS profile so all
+// translate calls share the underlying TCP / TLS / HTTP/2 connection pool.
+var oneshotClients sync.Map // map[clientKey]*req.Client
+
+// clientKey identifies a cached client. DeepL rate-limits the uTLS iOS
+// fingerprint outright on some networks (HTTP 429) even though the same
+// request over Go's default TLS succeeds, so the same proxy may need both a
+// fingerprinting and a plain client.
+type clientKey struct {
+	proxyURL       string
+	impersonateIOS bool
+}
+
+// iosFingerprintBlocked is set when DeepL answers the uTLS iOS profile with
+// 429. From then on this process sends plain-TLS requests instead of paying
+// for a rejected handshake on every translation; a restart re-probes.
+var iosFingerprintBlocked atomic.Bool
 
 func sharedCookieJar() http.CookieJar {
 	cookieJarOnce.Do(func() {
@@ -302,18 +317,19 @@ type oneshotRequest struct {
 	AppInformation appInformation `json:"app_information"`
 }
 
-// getOneshotClient returns a process-wide cached client for the given
-// proxy URL, creating it on first use. Sharing the client across
+// getOneshotClient returns a process-wide cached client for the given proxy
+// URL and TLS profile, creating it on first use. Sharing the client across
 // requests keeps the TLS / HTTP/2 connection in the pool.
-func getOneshotClient(proxyURL string) (*req.Client, error) {
-	if c, ok := oneshotClients.Load(proxyURL); ok {
+func getOneshotClient(proxyURL string, impersonateIOS bool) (*req.Client, error) {
+	key := clientKey{proxyURL: proxyURL, impersonateIOS: impersonateIOS}
+	if c, ok := oneshotClients.Load(key); ok {
 		return c.(*req.Client), nil
 	}
-	c, err := newOneshotClient(proxyURL)
+	c, err := newOneshotClient(proxyURL, impersonateIOS)
 	if err != nil {
 		return nil, err
 	}
-	if actual, loaded := oneshotClients.LoadOrStore(proxyURL, c); loaded {
+	if actual, loaded := oneshotClients.LoadOrStore(key, c); loaded {
 		return actual.(*req.Client), nil
 	}
 	go warmCookies(c)
@@ -330,7 +346,7 @@ func convertToRemoteDNS(proxyURL string) string {
 	return proxyURL
 }
 
-func newOneshotClient(proxyURL string) (*req.Client, error) {
+func newOneshotClient(proxyURL string, impersonateIOS bool) (*req.Client, error) {
 	// Match ItaClient's Ktor Darwin / URLSession profile:
 	//   - TLS ClientHello ≈ real iOS (utls HelloIOS_Auto)
 	//   - Cookie jar shared like URLSession's HTTPCookieStorage
@@ -338,7 +354,6 @@ func newOneshotClient(proxyURL string) (*req.Client, error) {
 	// Per-request headers (Authorization, User-Agent, x-app-*) are set in
 	// callOneshot; the client-level User-Agent is only a default.
 	client := req.C().
-		SetTLSFingerprintIOS().
 		SetCookieJar(sharedCookieJar()).
 		SetTimeout(oneshotTimeout).
 		SetUserAgent(iosUserAgent(iosAppVersion)).
@@ -348,6 +363,9 @@ func newOneshotClient(proxyURL string) (*req.Client, error) {
 		// Preferred language list — mirrors a US-locale device; DeepL
 		// does not hard-require a specific value for free oneshot.
 		SetCommonHeader("Accept-Language", "en-US,en;q=0.9")
+	if impersonateIOS {
+		client.SetTLSFingerprintIOS()
+	}
 
 	if proxyURL != "" {
 		u, err := url.Parse(convertToRemoteDNS(proxyURL))
@@ -380,6 +398,12 @@ func iosUserAgent(appVersion string) string {
 // pool picks the proxy for each attempt: a nil or empty pool connects
 // directly, while a populated pool rotates to the next available proxy on a
 // transport error or a 429 so one dead proxy cannot fail the request.
+//
+// DeepL rejects the uTLS iOS fingerprint with 429 on some networks while the
+// same request over Go's default TLS is accepted. Each attempt therefore
+// tries the iOS profile first and, on 429 only, retries the same proxy with
+// plain TLS. Once that happens the process stops spending a rejected
+// handshake on every request and uses plain TLS until it is restarted.
 func callOneshot(endpoint string, body []byte, bearerToken string, pool *proxy.ProxyPool, appVersion string) (gjson.Result, int, error) {
 	// LoginNone → literal "None"; LoginPro/Free → "Bearer <access_token>".
 	authValue := "None"
@@ -400,51 +424,62 @@ func callOneshot(endpoint string, body []byte, bearerToken string, pool *proxy.P
 			}
 		}
 
-		client, err := getOneshotClient(proxyURL)
-		if err != nil {
-			if proxyURL != "" {
-				pool.MarkFailed(proxyURL, "client_error")
+		profiles := []bool{true, false}
+		if iosFingerprintBlocked.Load() {
+			profiles = []bool{false}
+		}
+
+		failReason := "request_error"
+		for _, impersonateIOS := range profiles {
+			client, err := getOneshotClient(proxyURL, impersonateIOS)
+			if err != nil {
+				lastErr = err
+				failReason = "client_error"
+				continue
 			}
-			lastErr = err
-			continue
-		}
 
-		resp, err := client.R().
-			DisableAutoReadResponse().
-			SetHeader("Content-Type", "application/json").
-			SetHeader("Authorization", authValue).
-			SetHeader("User-Agent", iosUserAgent(appVersion)).
-			// ClientInfos.appHeaders (Util/ClientInfos.swift) — only these three
-			// x-app-* keys exist in the iOS binary.
-			SetHeader("x-app-os-version", iosOSVersion).
-			SetHeader("x-app-instance-id", instanceID).
-			SetHeader("x-app-session-id", sessionID).
-			SetBodyBytes(body). // pins Content-Length; an io.Reader would
-			// force Transfer-Encoding: chunked, which URLSession JSON bodies
-			// never emit.
-			Post(endpoint)
-		if err != nil {
-			if proxyURL != "" {
-				pool.MarkFailed(proxyURL, "request_error")
+			resp, err := client.R().
+				DisableAutoReadResponse().
+				SetHeader("Content-Type", "application/json").
+				SetHeader("Authorization", authValue).
+				SetHeader("User-Agent", iosUserAgent(appVersion)).
+				// ClientInfos.appHeaders (Util/ClientInfos.swift) — only these three
+				// x-app-* keys exist in the iOS binary.
+				SetHeader("x-app-os-version", iosOSVersion).
+				SetHeader("x-app-instance-id", instanceID).
+				SetHeader("x-app-session-id", sessionID).
+				SetBodyBytes(body). // pins Content-Length; an io.Reader would
+				// force Transfer-Encoding: chunked, which URLSession JSON bodies
+				// never emit.
+				Post(endpoint)
+			if err != nil {
+				lastErr = err
+				continue
 			}
-			lastErr = err
-			continue
-		}
 
-		raw, readErr := readOneshotBody(resp)
-		if readErr != nil {
-			return gjson.Result{}, resp.StatusCode, readErr
-		}
-
-		if resp.StatusCode == http.StatusTooManyRequests {
-			if proxyURL != "" {
-				pool.MarkFailed(proxyURL, "rate_limit")
+			raw, readErr := readOneshotBody(resp)
+			if readErr != nil {
+				return gjson.Result{}, resp.StatusCode, readErr
 			}
-			lastErr = fmt.Errorf("rate limit (429)")
-			continue
+
+			if resp.StatusCode == http.StatusTooManyRequests {
+				lastErr = fmt.Errorf("rate limit (429)")
+				failReason = "rate_limit"
+				if impersonateIOS {
+					if !iosFingerprintBlocked.Swap(true) {
+						log.Printf("[TLS] DeepL rate-limited the iOS fingerprint; using plain TLS for this process")
+					}
+					continue
+				}
+				break
+			}
+
+			return gjson.ParseBytes(raw), resp.StatusCode, nil
 		}
 
-		return gjson.ParseBytes(raw), resp.StatusCode, nil
+		if proxyURL != "" {
+			pool.MarkFailed(proxyURL, failReason)
+		}
 	}
 
 	return gjson.Result{}, 0, fmt.Errorf("all attempts failed after %d retries, last error: %w", maxRetries, lastErr)
