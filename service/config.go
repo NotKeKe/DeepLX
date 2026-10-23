@@ -17,7 +17,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/OwO-Network/DeepLX/proxy"
+	"github.com/OwO-Network/DLX/proxy"
 )
 
 type Config struct {

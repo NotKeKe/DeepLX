@@ -17,8 +17,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/OwO-Network/DeepLX/proxy"
-	"github.com/OwO-Network/DeepLX/service"
+	"github.com/OwO-Network/DLX/proxy"
+	"github.com/OwO-Network/DLX/service"
 )
 
 func main() {

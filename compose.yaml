@@ -26,11 +26,15 @@ services:
   deeplx:
     container_name: deeplx
     build: .
+    # Or use the published image instead of building locally:
+    # image: ghcr.io/owo-network/deeplx:latest
     restart: unless-stopped
     environment:
       - PROXY_LIST_URL=https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt
       - PROXY_UPDATE_INTERVAL=5
       - PROXY_LATENCY_TIMEOUT=3
+      # - TOKEN=helloworld
+      # - DL_SESSION=xxxxxx
     depends_on:
       - warp
     network_mode: "service:warp"

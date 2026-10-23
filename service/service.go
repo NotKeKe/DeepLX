@@ -13,6 +13,8 @@
 package service
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -72,6 +74,52 @@ type PayloadAPI struct {
 	TagHandling string   `json:"tag_handling"`
 }
 
+// PayloadTranslate is the request body of POST /translate. Unlike PayloadFree
+// (shared with the Pro endpoint), `text` accepts either a single string or an
+// array of strings.
+type PayloadTranslate struct {
+	Text        PayloadText `json:"text"`
+	SourceLang  string      `json:"source_lang"`
+	TargetLang  string      `json:"target_lang"`
+	TagHandling string      `json:"tag_handling"`
+}
+
+// PayloadText is the `text` field of POST /translate, in either documented
+// shape: a bare JSON string or an array of strings. Both are normalized to
+// Texts, and Batch records which shape the caller used so the response can
+// mirror it. Any other shape (a number, an object, an array holding
+// non-strings) fails the payload decode, which the handler reports as
+// 400 Invalid request payload; null names no text, like a body without the key.
+type PayloadText struct {
+	Texts []string
+	Batch bool
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (p *PayloadText) UnmarshalJSON(data []byte) error {
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		var texts []string
+		if err := json.Unmarshal(trimmed, &texts); err != nil {
+			return err
+		}
+		p.Texts, p.Batch = texts, true
+		return nil
+	}
+
+	// A JSON null names no text: leave the zero value, so Texts stays nil.
+	if string(trimmed) == "null" {
+		return nil
+	}
+
+	var text string
+	if err := json.Unmarshal(data, &text); err != nil {
+		return err
+	}
+	p.Texts, p.Batch = []string{text}, false
+	return nil
+}
+
 func Router(cfg *Config) *gin.Engine {
 	if cfg.Token != "" {
 		fmt.Println("Access token is set.")
@@ -90,8 +138,19 @@ func Router(cfg *Config) *gin.Engine {
 
 	// Free API endpoint, No Pro Account required
 	r.POST("/translate", authMiddleware(cfg), func(c *gin.Context) {
-		req := PayloadFree{}
+		req := PayloadTranslate{}
 		if err := c.BindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":    http.StatusBadRequest,
+				"message": "Invalid request payload",
+			})
+			return
+		}
+
+		// A body without `text` never named a text to translate, which is a
+		// payload error. `"text": []` names a list that happens to be empty,
+		// and is answered with an empty list, so it is not caught here.
+		if req.Text.Texts == nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"code":    http.StatusBadRequest,
 				"message": "Invalid request payload",
@@ -101,7 +160,7 @@ func Router(cfg *Config) *gin.Engine {
 
 		sourceLang := req.SourceLang
 		targetLang := req.TargetLang
-		translateText := req.TransText
+		texts := req.Text.Texts
 		tagHandling := req.TagHandling
 
 		if tagHandling != "" && tagHandling != "html" && tagHandling != "xml" {
@@ -112,7 +171,7 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, cfg.ProxyPool, "")
+		result, err := translate.TranslateByDLX(sourceLang, targetLang, texts, tagHandling, cfg.ProxyPool, "")
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -123,15 +182,22 @@ func Router(cfg *Config) *gin.Engine {
 		}
 
 		if result.Code == http.StatusOK {
-			c.JSON(http.StatusOK, gin.H{
+			response := gin.H{
 				"code":         http.StatusOK,
 				"id":           result.ID,
-				"data":         result.Data,
 				"alternatives": result.Alternatives,
 				"source_lang":  result.SourceLang,
 				"target_lang":  result.TargetLang,
 				"method":       result.Method,
-			})
+			}
+			// Mirror the request: a string in `text` answers with a string
+			// in `data`, an array answers with a position-aligned array.
+			if req.Text.Batch {
+				response["data"] = result.Data
+			} else {
+				response["data"] = result.Data[0]
+			}
+			c.JSON(http.StatusOK, response)
 		} else {
 			c.JSON(result.Code, gin.H{
 				"code":    result.Code,
@@ -186,7 +252,7 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, cfg.ProxyPool, dlSession)
+		result, err := translate.TranslateByDLX(sourceLang, targetLang, []string{translateText}, tagHandling, cfg.ProxyPool, dlSession)
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -200,7 +266,7 @@ func Router(cfg *Config) *gin.Engine {
 			c.JSON(http.StatusOK, gin.H{
 				"code":         http.StatusOK,
 				"id":           result.ID,
-				"data":         result.Data,
+				"data":         result.Data[0],
 				"alternatives": result.Alternatives,
 				"source_lang":  result.SourceLang,
 				"target_lang":  result.TargetLang,
@@ -218,14 +284,17 @@ func Router(cfg *Config) *gin.Engine {
 	// Free API endpoint, Consistent with the official API format
 	r.POST("/v2/translate", authMiddleware(cfg), func(c *gin.Context) {
 		var translateText string
+		var sourceLang string
 		var targetLang string
 
 		translateText = c.PostForm("text")
+		sourceLang = c.PostForm("source_lang")
 		targetLang = c.PostForm("target_lang")
 
 		if translateText == "" || targetLang == "" {
 			var jsonData struct {
 				Text       []string `json:"text"`
+				SourceLang string   `json:"source_lang"`
 				TargetLang string   `json:"target_lang"`
 			}
 
@@ -238,10 +307,11 @@ func Router(cfg *Config) *gin.Engine {
 			}
 
 			translateText = strings.Join(jsonData.Text, "\n")
+			sourceLang = jsonData.SourceLang
 			targetLang = jsonData.TargetLang
 		}
 
-		result, err := translate.TranslateByDeepLX("", targetLang, translateText, "", cfg.ProxyPool, "")
+		result, err := translate.TranslateByDLX(sourceLang, targetLang, []string{translateText}, "", cfg.ProxyPool, "")
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -256,7 +326,7 @@ func Router(cfg *Config) *gin.Engine {
 				"translations": []map[string]interface{}{
 					{
 						"detected_source_language": result.SourceLang,
-						"text":                     result.Data,
+						"text":                     result.Data[0],
 					},
 				},
 			})

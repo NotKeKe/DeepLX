@@ -2,7 +2,7 @@
  * @Author: Vincent Young
  * @Date: 2024-09-16 11:59:24
  * @LastEditors: Vincent Yang
- * @LastEditTime: 2026-05-22 00:00:00
+ * @LastEditTime: 2026-08-04 00:00:00
  * @FilePath: /DLX/translate/translate.go
  * @Telegram: https://t.me/missuo
  * @GitHub: https://github.com/missuo
@@ -30,72 +30,106 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/andybalholm/brotli"
 	"github.com/imroc/req/v3"
 	"github.com/tidwall/gjson"
 
-	"github.com/OwO-Network/DeepLX/proxy"
+	"github.com/OwO-Network/DLX/proxy"
 )
 
-// DeepL's interactive web translator migrated to a SignalR/WebSocket
-// channel and the legacy LMT_handle_texts backend on www2.deepl.com now
-// 429s anonymous traffic within a handful of calls. The official Chrome
-// extension instead POSTs to a stateless "oneshot" endpoint that lives
-// on a separate rate-limit pool and accepts the literal header
-// `Authorization: None` for anonymous requests — that is what we target.
+// DeepL's interactive clients (web, Chrome extension, and the official iOS
+// app) all share the same stateless "oneshot" translate endpoint. The
+// legacy LMT_handle_texts backend on www2.deepl.com rate-limits anonymous
+// traffic hard; oneshot lives on a separate pool and accepts the literal
+// header `Authorization: None` for free requests.
 //
-// The request we send is reverse-engineered from the extension's
-// background.js (Chrome Web Store ID cofdbpoegempjloogbagkncekinflcnj):
-//   - URL builder   → mN() at ~offset 529948
-//   - body builder  → IN() at ~offset 531200
-//   - fetch wrapper → JO() at ~offset 508659
-//   - app metadata  → Wo() at ~offset 16500
+// Request shape reverse-engineered from the DeepL iOS client (bundle
+// com.linguee.DeepLMobileTranslator, IPA Info.plist + ItaClient.framework).
+// The advertised app version is resolved at runtime from the App Store
+// (appversion.go) so a DeepL release cannot silently invalidate the profile;
+// iosAppVersion below is only the fallback.
+//
+//	Transport
+//	  ItaClient oneshot uses Ktor Darwin engine
+//	  (io.ktor.client.engine.darwin.KtorNSURLSessionDelegate) → real
+//	  URLSession TLS. We approximate that ClientHello with utls HelloIOS.
+//
+//	Free URL   → https://oneshot-free.www.deepl.com/v1/translate
+//	Pro URL    → https://oneshot. + <cell> + .pro.deepl.com/v1/translate
+//	             (we keep oneshot-pro.www as the free-tier Pro fallback)
+//
+//	Headers (ClientInfos.appHeaders + LoginNone):
+//	  Authorization: None          (ItaClient.LoginNone)
+//	  x-app-os-version             (UIDevice.systemVersion)
+//	  x-app-instance-id            (stable install UUID)
+//	  x-app-session-id             (session UUID)
+//	  User-Agent                   (URLSession / CFNetwork product form)
+//	  Accept / Accept-Encoding     (URLSession defaults)
+//
+//	Body (ItaClient OneShotTranslationRequestDto + AppInformation):
+//	  text[], target_lang, source_lang?, usage_type, app_information
+//	  usage_type ∈ {translate, ocr, voiceforconversations}
+//
+// DeepL rate-limits / temporarily bans clients whose TLS + UA + app_information
+// story is inconsistent (e.g. iOS TLS fingerprint + "iOS 27.0" in the UA when
+// 27 is not a shipping OS). Keep every field on one coherent iOS profile.
 const (
 	oneshotFreeEndpoint = "https://oneshot-free.www.deepl.com/v1/translate"
 	oneshotProEndpoint  = "https://oneshot-pro.www.deepl.com/v1/translate"
 
-	// Pinned to the Chrome version utls bundles into req v3 (HelloChrome_120).
-	// Keep this in lockstep with the user-agent and app_information.os_version
-	// so the TLS handshake, UA, and self-reported browser version all agree —
-	// a mismatch on any one of those is a cheap signal for the WAF.
-	impersonatedChromeMajor = "120"
-	chromeExtensionVersion  = "1.86.0"
-	chromeExtensionID       = "cofdbpoegempjloogbagkncekinflcnj"
+	// Fallback DeepL iOS version, used only when the runtime App Store
+	// lookup fails (appversion.go). Keep it tracking DeepL's current App Store
+	// release: a stale version is answered with HTTP 429 on every request
+	// ("your IP has been blocked by DeepL temporarily"), from any IP. The build
+	// number stays pinned because Apple's lookup API does not expose
+	// CFBundleVersion.
+	iosAppVersion = "26.52"
+	iosAppBuild   = "5443737"
+
+	// Reported OS version for app_information.os_version + x-app-os-version.
+	// IPA is built against iphoneos26.5 (DTPlatformVersion). Must be a real
+	// shipping major — a future value (e.g. 27.0) combined with an iOS TLS
+	// fingerprint is rejected with HTTP 429 and can temp-ban the IP.
+	iosOSVersion = "26.0"
+
+	// CFNetwork / Darwin versions that accompany URLSession User-Agents on
+	// the same OS generation as DTPlatformVersion 26.x (build machine
+	// BuildMachineOSBuild 25E246 → Darwin 25).
+	iosCFNetworkVersion = "3826.600.41"
+	iosDarwinVersion    = "25.0.0"
 
 	// oneshot enforces a 1500-character hard cap on the total length of
-	// the `text` array (sum across all items). Source: the extension's
-	// own `G.notLoggedIn = 1500` constant in background.js. The server
-	// returns 400 `{"errors":{"text":["text exceeds maximum length"]}}`
-	// past this; bail early to spare the upstream and give the caller a
-	// faster, less ambiguous error.
+	// the `text` array for anonymous traffic (same limit the Chrome
+	// extension documents as G.notLoggedIn). A character there is a UTF-16
+	// code unit — what JavaScript's String.prototype.length and Kotlin's
+	// String.length report — so an astral character counts as two. Bail
+	// early to spare the upstream and give the caller a faster error.
 	maxFreeTextLength = 1500
 
 	// oneshotTimeout caps how long we wait on a single translate request.
-	// Without an explicit timeout, a hung upstream connection would
-	// dangle indefinitely and the caller (e.g. browser extension) would
-	// sit on a spinner forever — observed in the field.
 	oneshotTimeout = 20 * time.Second
 
 	// warmupTimeout caps the initial GET to www.deepl.com that seeds the
-	// cookie jar. Shorter than oneshotTimeout because warmup typically
-	// completes in well under a second; we'd rather skip a slow warmup
-	// (cookies are best-effort anyway) than block the first translation.
+	// cookie jar. Cookies are best-effort; skip a slow warmup rather than
+	// block the first translation.
 	warmupTimeout = 5 * time.Second
 )
 
-// instanceID mirrors the UUID the extension persists in chrome.storage on
-// install: stable for the life of the process, reused on every request.
-// Rotating it per-request would be a far stronger signal than reusing one.
+// instanceID mirrors the UUID the iOS app persists for analytics /
+// app_information.instance_id and x-app-instance-id: stable for the life
+// of the process, reused on every request. Rotating per-request is a
+// stronger bot signal than reusing one.
 var instanceID = newInstanceID()
 
-// A real extension fetch() inherits whatever cookies the browser has
-// accumulated on .deepl.com. A cold visit to www.deepl.com sets
-// userCountry=<iso2> and verifiedBot=false; users who have ever opened
-// the site additionally have _ga / _ga_<id> from analytics JS. We share
-// a process-wide cookie jar so every oneshot POST automatically carries
-// whatever the warmup GET picked up.
+// sessionID is sent as x-app-session-id (ClientInfos.appHeaders). Stable
+// for the process lifetime, independent of instanceID.
+var sessionID = newInstanceID()
+
+// A real iOS URLSession inherits whatever cookies the app has on
+// .deepl.com. A cold visit to www.deepl.com sets userCountry=<iso2> and
+// verifiedBot=false. Share a process-wide jar so every oneshot POST
+// carries whatever the warmup GET picked up.
 var (
 	cookieJar     http.CookieJar
 	cookieJarOnce sync.Once
@@ -104,10 +138,6 @@ var (
 
 // oneshotClients caches one req.Client per proxy URL so all translate
 // calls share the underlying TCP / TLS / HTTP/2 connection pool.
-// Creating a fresh req.Client per request meant a brand-new TLS
-// handshake every time (~200-400ms of overhead on top of DeepL's own
-// ~1.5s processing latency). Reusing the client lets keep-alive +
-// session tickets cut that to near zero on the warm path.
 var oneshotClients sync.Map // map[string]*req.Client
 
 func sharedCookieJar() http.CookieJar {
@@ -119,12 +149,8 @@ func sharedCookieJar() http.CookieJar {
 }
 
 // warmCookies primes the shared jar by GETting www.deepl.com once.
-// The Set-Cookie response (userCountry / verifiedBot) lands on .deepl.com,
-// which is the eTLD+1 of oneshot-free.www.deepl.com, so subsequent POSTs
-// to the oneshot endpoint will carry those cookies automatically. The
-// same request doubles as a TLS-handshake warmup: it leaves a live
-// HTTP/2 connection to www.deepl.com in the client pool, which the
-// first oneshot POST then resumes via TLS session tickets.
+// The Set-Cookie response lands on .deepl.com (eTLD+1 of oneshot-free),
+// so subsequent POSTs carry those cookies automatically.
 func warmCookies(client *req.Client) {
 	cookieWarmer.Do(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), warmupTimeout)
@@ -144,21 +170,22 @@ func newInstanceID() string {
 	return fmt.Sprintf("%s-%s-%s-%s-%s", s[0:8], s[8:12], s[12:16], s[16:20], s[20:32])
 }
 
-// Language code tables mirror the bundled list in the extension's
-// background.js (arrays `y` ~offset 6000 for the full target-capable
-// set, `A` for source-only aliases). Keys are the uppercase forms
-// callers pass; values are the lowercase BCP-47-ish forms the oneshot
-// endpoint expects ("de", "en-US", "zh-Hans", ...).
+// Language code tables mirror ItaClient.OutputLanguage / InputLanguage
+// (regional cases enUs, enGb, frCa, deCh, ptPt, ptBr, es419, zhHant, …)
+// plus the full target-capable set the oneshot endpoint accepts.
 //
-// targetLangMap is what the API accepts as `target_lang`. EN and PT
-// are intentionally absent — DeepL deprecated them as target codes in
-// favour of EN-US/EN-GB and PT-BR/PT-PT, and the extension's y array
-// reflects that. We accept EN/PT as a backward-compat convenience and
-// resolve them to the regional default (en-US, pt-BR).
+// Keys are the uppercase forms callers pass; values are the lowercase
+// BCP-47-ish forms oneshot expects ("de", "en-US", "zh-Hans", ...).
+//
+// EN and PT are intentionally absent as bare target codes — DeepL
+// deprecated them in favour of EN-US/EN-GB and PT-BR/PT-PT. We accept
+// EN/PT as a backward-compat convenience and resolve them to the
+// regional default (en-US, pt-BR).
 var targetLangMap = map[string]string{
-	"AR": "ar", "BG": "bg", "CS": "cs", "DA": "da", "DE": "de", "EL": "el",
+	"AR": "ar", "BG": "bg", "CS": "cs", "DA": "da", "DE": "de", "DE-CH": "de-CH",
+	"EL":    "el",
 	"EN-GB": "en-GB", "EN-US": "en-US",
-	"ES": "es", "ES-419": "es-419", "ET": "et", "FI": "fi", "FR": "fr",
+	"ES": "es", "ES-419": "es-419", "ET": "et", "FI": "fi", "FR": "fr", "FR-CA": "fr-CA",
 	"HE": "he", "HU": "hu", "ID": "id", "IT": "it", "JA": "ja", "KO": "ko",
 	"LT": "lt", "LV": "lv", "NB": "nb", "NL": "nl", "PL": "pl",
 	"PT-BR": "pt-BR", "PT-PT": "pt-PT",
@@ -172,9 +199,8 @@ var targetLangMap = map[string]string{
 
 // sourceLangMap is what the API accepts as `source_lang`. It is a
 // superset of targetLangMap: EN and PT are first-class source codes
-// (extension array `A`) mapping to the generic "en"/"pt" — used when
-// the caller knows the input is English/Portuguese but does not want
-// to commit to a regional variant.
+// mapping to the generic "en"/"pt", and the Chinese codes all map to the
+// generic "zh".
 var sourceLangMap = func() map[string]string {
 	m := make(map[string]string, len(targetLangMap)+2)
 	for k, v := range targetLangMap {
@@ -182,6 +208,13 @@ var sourceLangMap = func() map[string]string {
 	}
 	m["EN"] = "en"
 	m["PT"] = "pt"
+	// DeepL's source codes are the generic language forms. zh-Hans/zh-Hant
+	// are target-only script variants: sent as a source hint they are
+	// silently ignored, so ambiguous mixed-script Chinese fell back to
+	// auto-detection and came back untranslated (#239).
+	m["ZH"] = "zh"
+	m["ZH-HANS"] = "zh"
+	m["ZH-HANT"] = "zh"
 	return m
 }()
 
@@ -248,9 +281,8 @@ func sortedKeys(m map[string]string) string {
 	return strings.Join(keys, ", ")
 }
 
-// appInformation matches the snake_case shape produced by background.js
-// Wo({isSnakeCase: true}). Values are pinned to the same Chrome version
-// as the TLS handshake so the request tells one consistent story.
+// appInformation matches ItaClient.AppInformation (os, os_version,
+// app_version, app_build, instance_id) as serialized by the iOS client.
 type appInformation struct {
 	OS         string `json:"os"`
 	OSVersion  string `json:"os_version"`
@@ -259,9 +291,9 @@ type appInformation struct {
 	InstanceID string `json:"instance_id"`
 }
 
-// oneshotRequest mirrors the body assembled in background.js IN(...).
-// Field order matches the extension's object literal so the serialized
-// JSON is byte-identical (encoding/json honours struct field order).
+// oneshotRequest mirrors the body assembled by the iOS OneShotTranslator
+// / ItaClient oneshot path. Field order matches the app's serialization
+// so the JSON is byte-stable (encoding/json honours struct field order).
 type oneshotRequest struct {
 	Text           []string       `json:"text"`
 	TargetLang     string         `json:"target_lang"`
@@ -270,21 +302,9 @@ type oneshotRequest struct {
 	AppInformation appInformation `json:"app_information"`
 }
 
-// newOneshotClient configures a req.Client whose outbound profile matches
-// a chrome-extension service-worker fetch() byte-for-byte where it can.
-// ImpersonateChrome gives us the Chrome 120 TLS ClientHello, HTTP/2
-// SETTINGS, pseudo/header order, and a sec-ch-ua/user-agent set tied to
-// the same version. It also installs a navigation-flavoured set of common
-// headers (pragma, cache-control, upgrade-insecure-requests, sec-fetch-user)
-// that a fetch() never emits — wipe those so the WAF cannot tell us apart
-// on that axis.
 // getOneshotClient returns a process-wide cached client for the given
 // proxy URL, creating it on first use. Sharing the client across
-// requests is the single biggest latency win we have on the warm path:
-// it keeps the TLS / HTTP/2 connection in the pool so subsequent
-// requests skip the handshake entirely. Kicks off cookie-jar warmup
-// in the background on first creation so that the first real translate
-// call lands on an already-established connection.
+// requests keeps the TLS / HTTP/2 connection in the pool.
 func getOneshotClient(proxyURL string) (*req.Client, error) {
 	if c, ok := oneshotClients.Load(proxyURL); ok {
 		return c.(*req.Client), nil
@@ -296,28 +316,41 @@ func getOneshotClient(proxyURL string) (*req.Client, error) {
 	if actual, loaded := oneshotClients.LoadOrStore(proxyURL, c); loaded {
 		return actual.(*req.Client), nil
 	}
-	// First time we've seen this proxy. Kick warmup off in the
-	// background so the very first translate call can run in parallel
-	// with the TLS handshake to www.deepl.com.
 	go warmCookies(c)
 	return c, nil
 }
 
+// convertToRemoteDNS delegates hostname resolution to the proxy for SOCKS
+// proxies. Without the socks5h/socks4a scheme the SOCKS client resolves the
+// destination locally, which both leaks DNS and fails when the local resolver
+// is blocked.
+func convertToRemoteDNS(proxyURL string) string {
+	proxyURL = strings.Replace(proxyURL, "socks5://", "socks5h://", 1)
+	proxyURL = strings.Replace(proxyURL, "socks4://", "socks4a://", 1)
+	return proxyURL
+}
+
 func newOneshotClient(proxyURL string) (*req.Client, error) {
-	client := req.C().ImpersonateChrome().SetCookieJar(sharedCookieJar()).SetTimeout(oneshotTimeout)
-	for _, h := range []string{
-		"Pragma",
-		"Cache-Control",
-		"Upgrade-Insecure-Requests",
-		"Sec-Fetch-User",
-	} {
-		client.Headers.Del(h)
-	}
-	client.SetCommonHeader("Accept-Encoding", "gzip, deflate, br")
+	// Match ItaClient's Ktor Darwin / URLSession profile:
+	//   - TLS ClientHello ≈ real iOS (utls HelloIOS_Auto)
+	//   - Cookie jar shared like URLSession's HTTPCookieStorage
+	//   - Common headers = what URLSession attaches by default
+	// Per-request headers (Authorization, User-Agent, x-app-*) are set in
+	// callOneshot; the client-level User-Agent is only a default.
+	client := req.C().
+		SetTLSFingerprintIOS().
+		SetCookieJar(sharedCookieJar()).
+		SetTimeout(oneshotTimeout).
+		SetUserAgent(iosUserAgent(iosAppVersion)).
+		// URLSession default Accept-Encoding for data tasks.
+		SetCommonHeader("Accept-Encoding", "gzip, deflate, br").
+		SetCommonHeader("Accept", "*/*").
+		// Preferred language list — mirrors a US-locale device; DeepL
+		// does not hard-require a specific value for free oneshot.
+		SetCommonHeader("Accept-Language", "en-US,en;q=0.9")
 
 	if proxyURL != "" {
-		proxyURL = convertToRemoteDNS(proxyURL)
-		u, err := url.Parse(proxyURL)
+		u, err := url.Parse(convertToRemoteDNS(proxyURL))
 		if err != nil {
 			return nil, err
 		}
@@ -326,80 +359,87 @@ func newOneshotClient(proxyURL string) (*req.Client, error) {
 	return client, nil
 }
 
-func convertToRemoteDNS(proxyURL string) string {
-	proxyURL = strings.Replace(proxyURL, "socks5://", "socks5h://", 1)
-	proxyURL = strings.Replace(proxyURL, "socks4://", "socks4a://", 1)
-	proxyURL = strings.Replace(proxyURL, "http://", "http://", 1)
-	return proxyURL
+// iosUserAgent is the URLSession product-style User-Agent the app's Ktor
+// Darwin stack emits (CFBundleName/CFBundleShortVersionString + CFNetwork
+// + Darwin). Do NOT invent alternate formats (e.g. embedding the bundle
+// ID) — mismatched UA + iOS TLS fingerprint is a cheap ban signal.
+func iosUserAgent(appVersion string) string {
+	return fmt.Sprintf(
+		"DeepL/%s CFNetwork/%s Darwin/%s",
+		appVersion, iosCFNetworkVersion, iosDarwinVersion,
+	)
 }
 
 // callOneshot POSTs to the oneshot endpoint and returns the parsed JSON.
 // For anonymous traffic bearerToken is empty and we send the literal
-// header `Authorization: None` — replicating the extension's JO() wrapper
-// exactly. Omitting that header instead would put the request on a
-// different server-side auth branch.
-func callOneshot(endpoint string, body []byte, bearerToken string, pool *proxy.ProxyPool) (gjson.Result, int, error) {
-	var lastErr error
-	maxRetries := 3
+// header `Authorization: None` — matching ItaClient.LoginNone. Omitting
+// that header puts the request on a different server-side auth branch.
+// appVersion is the value the request body advertises; the same value is
+// echoed in the User-Agent so TLS, UA and app_information stay consistent.
+//
+// pool picks the proxy for each attempt: a nil or empty pool connects
+// directly, while a populated pool rotates to the next available proxy on a
+// transport error or a 429 so one dead proxy cannot fail the request.
+func callOneshot(endpoint string, body []byte, bearerToken string, pool *proxy.ProxyPool, appVersion string) (gjson.Result, int, error) {
+	// LoginNone → literal "None"; LoginPro/Free → "Bearer <access_token>".
+	authValue := "None"
+	if bearerToken != "" {
+		authValue = "Bearer " + bearerToken
+	}
 
-	for i := 0; i < maxRetries; i++ {
-		proxyInfo := pool.GetNextProxy()
-		if proxyInfo == nil {
-			return gjson.Result{}, 0, fmt.Errorf("no available proxies")
+	const maxRetries = 3
+	var lastErr error
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		proxyURL := ""
+		if pool != nil {
+			if info := pool.GetNextProxy(); info != nil {
+				proxyURL = info.URL
+				log.Printf("[Proxy] Using: %s (latency: %dms)", proxyURL, info.LatencyMs)
+			} else if len(pool.GetState().Proxies) > 0 {
+				return gjson.Result{}, 0, fmt.Errorf("no available proxies")
+			}
 		}
 
-		proxyURL := proxyInfo.URL
-		log.Printf("[Proxy] Using: %s (latency: %dms)", proxyURL, proxyInfo.LatencyMs)
 		client, err := getOneshotClient(proxyURL)
 		if err != nil {
+			if proxyURL != "" {
+				pool.MarkFailed(proxyURL, "client_error")
+			}
 			lastErr = err
 			continue
-		}
-
-		authValue := "None"
-		if bearerToken != "" {
-			authValue = "Bearer " + bearerToken
 		}
 
 		resp, err := client.R().
 			DisableAutoReadResponse().
 			SetHeader("Content-Type", "application/json").
-			SetHeader("Accept", "*/*").
 			SetHeader("Authorization", authValue).
-			SetHeader("Origin", "chrome-extension://"+chromeExtensionID).
-			SetHeader("Sec-Fetch-Site", "cross-site").
-			SetHeader("Sec-Fetch-Mode", "cors").
-			SetHeader("Sec-Fetch-Dest", "empty").
-			SetBodyBytes(body).
+			SetHeader("User-Agent", iosUserAgent(appVersion)).
+			// ClientInfos.appHeaders (Util/ClientInfos.swift) — only these three
+			// x-app-* keys exist in the iOS binary.
+			SetHeader("x-app-os-version", iosOSVersion).
+			SetHeader("x-app-instance-id", instanceID).
+			SetHeader("x-app-session-id", sessionID).
+			SetBodyBytes(body). // pins Content-Length; an io.Reader would
+			// force Transfer-Encoding: chunked, which URLSession JSON bodies
+			// never emit.
 			Post(endpoint)
 		if err != nil {
-			pool.MarkFailed(proxyURL, "request_error")
+			if proxyURL != "" {
+				pool.MarkFailed(proxyURL, "request_error")
+			}
 			lastErr = err
 			continue
 		}
-		defer resp.Body.Close()
 
-		var reader io.Reader = resp.Body
-		switch strings.ToLower(resp.Header.Get("Content-Encoding")) {
-		case "gzip":
-			gr, err := gzip.NewReader(resp.Body)
-			if err != nil {
-				return gjson.Result{}, resp.StatusCode, fmt.Errorf("gzip reader: %w", err)
-			}
-			defer gr.Close()
-			reader = gr
-		case "deflate":
-			reader = flate.NewReader(resp.Body)
-		case "br":
-			reader = brotli.NewReader(resp.Body)
-		}
-		raw, err := io.ReadAll(reader)
-		if err != nil {
-			return gjson.Result{}, resp.StatusCode, fmt.Errorf("read response body: %w", err)
+		raw, readErr := readOneshotBody(resp)
+		if readErr != nil {
+			return gjson.Result{}, resp.StatusCode, readErr
 		}
 
 		if resp.StatusCode == http.StatusTooManyRequests {
-			pool.MarkFailed(proxyURL, "rate_limit")
+			if proxyURL != "" {
+				pool.MarkFailed(proxyURL, "rate_limit")
+			}
 			lastErr = fmt.Errorf("rate limit (429)")
 			continue
 		}
@@ -407,20 +447,114 @@ func callOneshot(endpoint string, body []byte, bearerToken string, pool *proxy.P
 		return gjson.ParseBytes(raw), resp.StatusCode, nil
 	}
 
-	return gjson.Result{}, 0, fmt.Errorf("all proxies failed after %d retries, last error: %w", maxRetries, lastErr)
+	return gjson.Result{}, 0, fmt.Errorf("all attempts failed after %d retries, last error: %w", maxRetries, lastErr)
+}
+
+// readOneshotBody drains and decompresses a oneshot response. Once
+// Accept-Encoding is set explicitly, Go's HTTP stack stops decompressing
+// transparently, so gzip/deflate/br are handled here.
+func readOneshotBody(resp *req.Response) ([]byte, error) {
+	defer resp.Body.Close()
+
+	var reader io.Reader = resp.Body
+	switch strings.ToLower(resp.Header.Get("Content-Encoding")) {
+	case "gzip":
+		gr, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			return nil, fmt.Errorf("gzip reader: %w", err)
+		}
+		defer gr.Close()
+		reader = gr
+	case "deflate":
+		reader = flate.NewReader(resp.Body)
+	case "br":
+		reader = brotli.NewReader(resp.Body)
+	}
+	return io.ReadAll(reader)
+}
+
+// textLength returns the length of text in UTF-16 code units — the unit
+// oneshot's anonymous 1500-character cap counts, and the one the DeepL clients
+// this profile mirrors report (the iOS app is Kotlin, the extension is
+// JavaScript). An astral character is a surrogate pair and so counts as two,
+// where a rune count scores it one and lets an oversized request travel
+// upstream to be rejected there as a bare 400.
+//
+// Invalid UTF-8 needs no special case: the request body is decoded with
+// encoding/json before this runs, which replaces every invalid byte with
+// U+FFFD, and each replacement is one unit either way.
+func textLength(text string) int {
+	n := 0
+	for _, r := range text {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
+// textsToTranslate returns the positions of the texts that carry something to
+// translate and their total length in UTF-16 code units. A blank text — empty,
+// or nothing but whitespace — carries nothing to translate, so it is not sent:
+// its own text is the answer, which keeps a segmented document position-aligned
+// and lets an empty line pass through instead of failing the request.
+func textsToTranslate(texts []string) (positions []int, total int) {
+	for i, text := range texts {
+		if strings.TrimSpace(text) == "" {
+			continue
+		}
+		positions = append(positions, i)
+		total += textLength(text)
+	}
+	return positions, total
+}
+
+// mergeTranslations puts the translations back at the positions they were asked
+// for, leaving every text that was not sent — a blank one — exactly as it
+// arrived.
+func mergeTranslations(texts []string, positions []int, translations []string) []string {
+	merged := make([]string, len(texts))
+	copy(merged, texts)
+	for i, position := range positions {
+		merged[position] = translations[i]
+	}
+	return merged
+}
+
+// translationsFromResult extracts exactly count non-empty translations from
+// an oneshot response body. oneshot answers `text` arrays positionally, so a
+// batch is all-or-nothing: if upstream returns a different number of
+// translations or leaves one of them empty, the caller fails as a whole
+// instead of answering with a misaligned list or a placeholder.
+func translationsFromResult(result gjson.Result, count int) ([]string, error) {
+	translations := result.Get("translations").Array()
+	if len(translations) != count {
+		return nil, fmt.Errorf("expected %d translation(s), got %d", count, len(translations))
+	}
+	texts := make([]string, 0, count)
+	for _, translation := range translations {
+		text := translation.Get("text").String()
+		if text == "" {
+			return nil, errors.New("upstream returned an empty translation")
+		}
+		texts = append(texts, text)
+	}
+	return texts, nil
 }
 
 // TranslateByDLX performs translation via the DeepL oneshot endpoint.
-// Passing dlSession switches to the Pro endpoint; the value is sent
-// verbatim as the Bearer token (i.e. it must be an OAuth access token,
-// not the legacy dl_session cookie).
-func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, pool *proxy.ProxyPool, dlSession string) (DeepLXTranslationResult, error) {
-	if text == "" {
-		return DLXTranslationResult{
-			Code:    http.StatusNotFound,
-			Message: "No text to translate",
-		}, nil
-	}
+// texts holds one or more source strings: oneshot's `text` body field is an
+// array, so a whole batch travels in a single upstream request and the
+// returned Data stays position-aligned with texts. Passing dlSession switches
+// to the Pro endpoint; the value is sent verbatim as the Bearer token (i.e.
+// it must be an OAuth access token, not the legacy dl_session cookie).
+func TranslateByDLX(sourceLang, targetLang string, texts []string, tagHandling string, pool *proxy.ProxyPool, dlSession string) (DLXTranslationResult, error) {
+	// oneshot charges its anonymous cap against the total length of the
+	// `text` array, and a batch is one upstream request, so the cap applies
+	// to the sum of the texts that are actually sent.
+	positions, totalLength := textsToTranslate(texts)
 
 	resolvedTarget, err := resolveTargetLang(targetLang)
 	if err != nil {
@@ -437,23 +571,57 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 		}, nil
 	}
 
-	if n := utf8.RuneCountInString(text); n > maxFreeTextLength {
+	if totalLength > maxFreeTextLength {
 		return DLXTranslationResult{
 			Code:    http.StatusRequestEntityTooLarge,
-			Message: fmt.Sprintf("text exceeds maximum length: %d characters (anonymous oneshot limit is %d)", n, maxFreeTextLength),
+			Message: fmt.Sprintf("text exceeds maximum length: %d characters (anonymous oneshot limit is %d)", totalLength, maxFreeTextLength),
 		}, nil
 	}
 
+	// Nothing to translate: every text is blank, so none of them travels and
+	// the request is answered with its own texts — an empty list in, an empty
+	// list out — exactly as a blank element is inside a request that does have
+	// something to translate.
+	if len(positions) == 0 {
+		return DLXTranslationResult{
+			Code:         http.StatusOK,
+			ID:           time.Now().UnixMilli(),
+			Data:         mergeTranslations(texts, positions, nil),
+			Alternatives: nil, // oneshot does not return alternatives
+			SourceLang:   sourceLang,
+			TargetLang:   targetLang,
+			Method:       map[bool]string{true: "Pro", false: "Free"}[dlSession != ""],
+		}, nil
+	}
+
+	// tagHandling is accepted by the public DLX API for compatibility
+	// but oneshot does not expose html/xml tag handling the way the
+	// official v2 API does — ignored upstream.
+	_ = tagHandling
+
+	// Resolve the advertised version once per request so the User-Agent and
+	// app_information always agree; the lookup itself is cached (appversion.go).
+	appVersion := currentIOSAppVersion()
+
+	// Blank texts stay here: oneshot echoes an empty input, and the positional
+	// check on the answer would read that echo as a failed translation and fail
+	// the batch, so there is nothing to gain by sending them.
+	requested := make([]string, 0, len(positions))
+	for _, position := range positions {
+		requested = append(requested, texts[position])
+	}
+
 	reqStruct := oneshotRequest{
-		Text:       []string{text},
+		Text:       requested,
 		TargetLang: resolvedTarget,
-		SourceLang: resolvedSource,
-		UsageType:  "Translate",
+		SourceLang: resolvedSource, // empty = autodetect; omitempty drops the field
+		// ItaClient.OneShotUsageType.translate (also: ocr, voiceforconversations)
+		UsageType: "translate",
 		AppInformation: appInformation{
-			OS:         "brex_macOS",
-			OSVersion:  "brex_chrome_" + impersonatedChromeMajor + ".0.0.0",
-			AppVersion: chromeExtensionVersion,
-			AppBuild:   "chrome_web_store",
+			OS:         "iOS",
+			OSVersion:  iosOSVersion,
+			AppVersion: appVersion,
+			AppBuild:   iosAppBuild,
 			InstanceID: instanceID,
 		},
 	}
@@ -465,8 +633,10 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 	}
 
 	id := time.Now().UnixMilli()
-	result, status, err := callOneshot(endpoint, bodyBytes, dlSession, pool)
+	result, status, err := callOneshot(endpoint, bodyBytes, dlSession, pool, appVersion)
 	if err != nil {
+		// Map upstream timeouts to 504 so callers can distinguish "DeepL
+		// took too long" from other 503 failure modes (DNS, TLS, etc.).
 		var ue *url.Error
 		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &ue) && ue.Timeout()) {
 			return DLXTranslationResult{
@@ -484,11 +654,27 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 
 	switch status {
 	case http.StatusOK:
+		// fall through to body parsing
 	case http.StatusTooManyRequests:
 		return DLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusTooManyRequests,
 			Message: "too many requests, your IP has been blocked by DeepL temporarily, please don't request it frequently in a short time",
+		}, nil
+	case http.StatusForbidden:
+		// iOS surfaces this as OneShot: Forbidden / AuthenticationFailed /
+		// OutdatedClient / UserBlocked depending on body; collapse to 403.
+		msg := result.Get("title").String()
+		if msg == "" {
+			msg = result.Get("message").String()
+		}
+		if msg == "" {
+			msg = "request forbidden by DeepL (auth failed, outdated client, or blocked)"
+		}
+		return DLXTranslationResult{
+			ID:      id,
+			Code:    http.StatusForbidden,
+			Message: msg,
 		}, nil
 	default:
 		return DLXTranslationResult{
@@ -498,8 +684,8 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 		}, nil
 	}
 
-	translations := result.Get("translations").Array()
-	if len(translations) == 0 {
+	translations, err := translationsFromResult(result, len(requested))
+	if err != nil {
 		return DLXTranslationResult{
 			ID:      id,
 			Code:    http.StatusServiceUnavailable,
@@ -507,24 +693,15 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 		}, nil
 	}
 
-	mainText := translations[0].Get("text").String()
-	if mainText == "" {
-		return DLXTranslationResult{
-			ID:      id,
-			Code:    http.StatusServiceUnavailable,
-			Message: "Translation failed",
-		}, nil
-	}
-
-	if detected := translations[0].Get("detected_source_language").String(); detected != "" {
+	if detected := result.Get("translations.0.detected_source_language").String(); detected != "" {
 		sourceLang = strings.ToUpper(detected)
 	}
 
 	return DLXTranslationResult{
 		Code:         http.StatusOK,
 		ID:           id,
-		Data:         mainText,
-		Alternatives: nil,
+		Data:         mergeTranslations(texts, positions, translations),
+		Alternatives: nil, // oneshot does not return alternatives
 		SourceLang:   sourceLang,
 		TargetLang:   targetLang,
 		Method:       map[bool]string{true: "Pro", false: "Free"}[dlSession != ""],
