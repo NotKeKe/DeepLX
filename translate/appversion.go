@@ -13,10 +13,12 @@
 package translate
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -51,13 +53,24 @@ var deeplAppStoreLookupURL = fmt.Sprintf(
 const (
 	appVersionCacheTTL      = 24 * time.Hour
 	appVersionRetryBackoff  = 15 * time.Minute
-	appVersionLookupTimeout = 3 * time.Second
+	appVersionLookupTimeout = 5 * time.Second
 )
 
 // appVersionHTTPClient is shared so repeat lookups reuse the connection pool.
 // It is separate from the translation client: no TLS fingerprint, no cookies,
-// no proxy.
-var appVersionHTTPClient = &http.Client{Timeout: appVersionLookupTimeout}
+// no proxy. The dialer is IPv4-only because Apple's CDN advertises AAAA
+// records that black-hole on some networks; Go's default dialer then waits for
+// the TLS handshake until the timeout, even though the A record answers in
+// milliseconds.
+var appVersionHTTPClient = &http.Client{
+	Timeout: appVersionLookupTimeout,
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: appVersionLookupTimeout}
+			return dialer.DialContext(ctx, "tcp4", addr)
+		},
+	},
+}
 
 // appVersionProvider resolves and caches the DeepL iOS version this client
 // advertises. The zero value is ready to use.
