@@ -137,7 +137,7 @@ func Router(cfg *Config) *gin.Engine {
 	})
 
 	// Free API endpoint, No Pro Account required
-	r.POST("/translate", authMiddleware(cfg), func(c *gin.Context) {
+	translateHandler := func(c *gin.Context) {
 		req := PayloadTranslate{}
 		if err := c.BindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
@@ -205,7 +205,15 @@ func Router(cfg *Config) *gin.Engine {
 			})
 
 		}
-	})
+	}
+
+	translateAuth := authMiddleware(cfg)
+	r.POST("/translate", translateAuth, translateHandler)
+	// Compatibility alias: some DeepLX clients, including Immersive
+	// Translate's DeepLX integration, are configured with only the server base
+	// URL and therefore POST to "/". Treat that as POST /translate instead of
+	// answering 404.
+	r.POST("/", translateAuth, translateHandler)
 
 	// Pro API endpoint, Pro Account required
 	r.POST("/v1/translate", authMiddleware(cfg), func(c *gin.Context) {

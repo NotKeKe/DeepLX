@@ -52,6 +52,28 @@ func TestPayloadTextUnmarshalJSON(t *testing.T) {
 	}
 }
 
+// Clients that are configured with only the server base URL POST to "/".
+// The alias must behave exactly like POST /translate and must not shadow the
+// GET / information endpoint.
+func TestTranslateBaseURLCompatibility(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := Router(&Config{})
+
+	for _, path := range []string{"/translate", "/"} {
+		recorder := httptest.NewRecorder()
+		request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"text":"","target_lang":"EN"}`))
+		request.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(recorder, request)
+
+		if recorder.Code != http.StatusOK {
+			t.Fatalf("POST %s = %d %s, want 200", path, recorder.Code, recorder.Body.String())
+		}
+		if !strings.Contains(recorder.Body.String(), `"data":""`) {
+			t.Fatalf("POST %s body = %s, want it to contain \"data\":\"\"", path, recorder.Body.String())
+		}
+	}
+}
+
 // POST /translate mirrors the shape it was given, and no shape that carries
 // text is an error any more — an empty text is answered with itself and an
 // empty array with an empty array. Every case here is answered (or refused)
