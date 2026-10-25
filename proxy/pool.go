@@ -3,6 +3,7 @@ package proxy
 import (
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -193,6 +194,7 @@ func (p *ProxyPool) Stop() {
 func (p *ProxyPool) UpdatePool() {
 	proxyList, err := p.fetchProxyList()
 	if err != nil {
+		log.Printf("[Proxy] refresh failed: %v", err)
 		return
 	}
 
@@ -200,7 +202,7 @@ func (p *ProxyPool) UpdatePool() {
 	// more than MaxPool entries, so a huge upstream list cannot blow up memory,
 	// and successive refreshes sample different parts of it.
 	maxPool := p.maxPoolSize()
-	candidates := p.nextCandidateWindow(proxyList, maxPool)
+	candidates, offset := p.nextCandidateWindow(proxyList, maxPool)
 
 	// Fixed worker pool: goroutine count is bounded by the concurrency limit,
 	// and the results channel is pre-sized so nothing blocks on collection.
@@ -266,16 +268,22 @@ func (p *ProxyPool) UpdatePool() {
 	p.available = available
 	p.nextIndex = 0
 	p.mu.Unlock()
+
+	// One line per refresh (default: every 5 minutes) so operators can tell the
+	// pool is actually being populated without a log line per translation.
+	log.Printf("[Proxy] pool refreshed: %d available / %d probed (window offset %d of %d list lines)",
+		available, len(candidates), offset, len(proxyList))
 }
 
 // nextCandidateWindow returns up to maxPool valid, de-duplicated proxy URLs
-// starting at a rotating offset in proxyList. The offset advances by one window
-// per refresh, so a dead or blocked head of a huge list cannot keep the pool
-// empty forever; it stays in memory because the window itself is bounded.
-func (p *ProxyPool) nextCandidateWindow(proxyList []string, maxPool int) []string {
+// starting at a rotating offset in proxyList, plus the offset it used. The
+// offset advances by one window per refresh, so a dead or blocked head of a huge
+// list cannot keep the pool empty forever; it stays in memory because the window
+// itself is bounded.
+func (p *ProxyPool) nextCandidateWindow(proxyList []string, maxPool int) ([]string, int) {
 	candidates := make([]string, 0, min(len(proxyList), maxPool))
 	if len(proxyList) == 0 {
-		return candidates
+		return candidates, 0
 	}
 
 	window := min(maxPool, len(proxyList))
@@ -300,7 +308,7 @@ func (p *ProxyPool) nextCandidateWindow(proxyList []string, maxPool int) []strin
 		candidates = append(candidates, proxyURL)
 	}
 
-	return candidates
+	return candidates, offset
 }
 
 func (p *ProxyPool) maxPoolSize() int {
