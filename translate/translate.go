@@ -418,8 +418,7 @@ func callOneshot(endpoint string, body []byte, bearerToken string, pool *proxy.P
 		if pool != nil {
 			if info := pool.GetNextProxy(); info != nil {
 				proxyURL = info.URL
-				log.Printf("[Proxy] Using: %s (latency: %dms)", proxyURL, info.LatencyMs)
-			} else if len(pool.GetState().Proxies) > 0 {
+			} else if pool.ProxyCount() > 0 {
 				return gjson.Result{}, 0, fmt.Errorf("no available proxies")
 			}
 		}

@@ -9,8 +9,15 @@
         - PROXY_LIST_URL=PROXY_URL_TXT
         - PROXY_UPDATE_INTERVAL=5
         - PROXY_LATENCY_TIMEOUT=3
+        # 選用：每次更新最多探測/保留幾個 proxy，以及同時探測的併發數。
+        # 預設 200 / 32；清單很大（例如 8 萬多行）時，這兩個上限決定記憶體用量。
+        # - PROXY_MAX_POOL=200
+        # - PROXY_PROBE_CONCURRENCY=32
     ```
     - PROXY_URL_TXT 是一個網路連結，如 `https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt`
+    - 清單只會取樣其中 `PROXY_MAX_POOL` 條來探測與輪替使用（每次更新會換一個區段），
+      探測失敗的 proxy 會標記為 failed 並跳過；同時建議在 compose file 加上
+      `GOMEMLIMIT=256MiB`，讓 Go runtime 有記憶體上限。
 2. cloudflare warp 的支援
   - 加上了 `caomingjun/warp`，為了隱私
     - 我不希望那些免費 proxy 紀錄我的 IP，所以我加上了 cloudflare warp。

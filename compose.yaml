@@ -33,6 +33,13 @@ services:
       - PROXY_LIST_URL=https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt
       - PROXY_UPDATE_INTERVAL=5
       - PROXY_LATENCY_TIMEOUT=3
+      # Bound one refresh: probe at most 32 proxies at a time, keep at most 200.
+      # Without these caps the ~85k-line upstream list spawns one goroutine per
+      # proxy and pushes RSS into the gigabytes.
+      - PROXY_PROBE_CONCURRENCY=32
+      - PROXY_MAX_POOL=200
+      # Soft memory ceiling as a safety net (Go runtime honours GOMEMLIMIT).
+      - GOMEMLIMIT=256MiB
       # - TOKEN=helloworld
       # - DL_SESSION=xxxxxx
     depends_on:

@@ -25,7 +25,10 @@ func main() {
 	cfg := service.InitConfig()
 
 	if cfg.ProxyListURL != "" {
-		pool := proxy.NewProxyPool(cfg.ProxyListURL, cfg.UpdateInterval, cfg.LatencyTimeout)
+		pool := proxy.NewProxyPool(cfg.ProxyListURL, cfg.UpdateInterval, cfg.LatencyTimeout,
+			proxy.WithMaxPool(cfg.ProxyMaxPool),
+			proxy.WithProbeConcurrency(cfg.ProxyProbeConcurrency),
+		)
 		pool.Start()
 		cfg.ProxyPool = pool
 	} else if cfg.Proxy != "" {

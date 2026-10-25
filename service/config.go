@@ -16,26 +16,38 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/OwO-Network/DLX/proxy"
 )
 
+const (
+	// Refresh bounds: see proxy.ProxyPool. The list is huge, so both numbers
+	// stay small by default.
+	defaultProxyMaxPool          = 200
+	defaultProxyProbeConcurrency = 32
+)
+
 type Config struct {
-	IP               string
-	Port             int
-	Token            string
-	DlSession        string
-	Proxy            string
-	ProxyListURL     string
-	UpdateInterval   int
-	LatencyTimeout   int
-	ProxyPool        *proxy.ProxyPool
+	IP                    string
+	Port                  int
+	Token                 string
+	DlSession             string
+	Proxy                 string
+	ProxyListURL          string
+	UpdateInterval        int
+	LatencyTimeout        int
+	ProxyMaxPool          int
+	ProxyProbeConcurrency int
+	ProxyPool             *proxy.ProxyPool
 }
 
 func InitConfig() *Config {
 	cfg := &Config{
-		IP:   "0.0.0.0",
-		Port: 1188,
+		IP:                    "0.0.0.0",
+		Port:                  1188,
+		ProxyMaxPool:          defaultProxyMaxPool,
+		ProxyProbeConcurrency: defaultProxyProbeConcurrency,
 	}
 
 	// IP flag
@@ -100,6 +112,37 @@ func InitConfig() *Config {
 	}
 	flag.IntVar(&cfg.LatencyTimeout, "proxy-latency-timeout", cfg.LatencyTimeout, "set the latency timeout in seconds")
 
+	// Proxy Max Pool flag: how many list entries one refresh probes and keeps.
+	cfg.ProxyMaxPool = envPositiveInt("PROXY_MAX_POOL", defaultProxyMaxPool)
+	flag.IntVar(&cfg.ProxyMaxPool, "proxy-max-pool", cfg.ProxyMaxPool, "set the maximum number of proxies to probe and keep per refresh")
+
+	// Proxy Probe Concurrency flag: simultaneous probes per refresh.
+	cfg.ProxyProbeConcurrency = envPositiveInt("PROXY_PROBE_CONCURRENCY", defaultProxyProbeConcurrency)
+	flag.IntVar(&cfg.ProxyProbeConcurrency, "proxy-probe-concurrency", cfg.ProxyProbeConcurrency, "set how many proxies to probe concurrently")
+
 	flag.Parse()
+
+	// Clamp a non-positive flag value back to the safe defaults.
+	if cfg.ProxyMaxPool < 1 {
+		cfg.ProxyMaxPool = defaultProxyMaxPool
+	}
+	if cfg.ProxyProbeConcurrency < 1 {
+		cfg.ProxyProbeConcurrency = defaultProxyProbeConcurrency
+	}
+
 	return cfg
+}
+
+// envPositiveInt reads a positive integer from the environment and falls back
+// to fallback when the variable is unset, empty, or not a positive integer.
+func envPositiveInt(name string, fallback int) int {
+	value, ok := os.LookupEnv(name)
+	if !ok || value == "" {
+		return fallback
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil || parsed < 1 {
+		return fallback
+	}
+	return parsed
 }

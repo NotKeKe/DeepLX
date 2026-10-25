@@ -1,111 +1,173 @@
 package proxy
 
 import (
-	"io/ioutil"
+	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
 
+const (
+	statusAvailable = "available"
+	statusFailed    = "failed"
+
+	// A refresh probes at most ProbeConcurrency proxies at a time and keeps at
+	// most MaxPool entries from the upstream list. The public list holds tens of
+	// thousands of entries, and one goroutine plus TLS buffers per entry costs
+	// gigabytes of RAM, so both bounds stay small.
+	defaultProbeConcurrency = 32
+	defaultMaxPool          = 200
+
+	// maxProxyListBytes caps how much of the upstream list is read.
+	maxProxyListBytes = 8 << 20 // 8 MiB
+
+	listFetchTimeout = 30 * time.Second
+	probeTargetURL   = "https://www.google.com"
+)
+
 type ProxyState struct {
 	LastUpdated    time.Time   `json:"lastUpdated"`
-	UpdateInterval  int         `json:"updateInterval"`
-	LatencyTimeout  int         `json:"latencyTimeout"`
-	Proxies         []ProxyInfo `json:"proxies"`
-	TotalRequests   int64       `json:"totalRequests"`
-	FailedRequests  int64       `json:"failedRequests"`
+	UpdateInterval int         `json:"updateInterval"`
+	LatencyTimeout int         `json:"latencyTimeout"`
+	Proxies        []ProxyInfo `json:"proxies"`
+	TotalRequests  int64       `json:"totalRequests"`
+	FailedRequests int64       `json:"failedRequests"`
 }
 
 type ProxyInfo struct {
-	URL           string  `json:"url"`
-	LatencyMs     int     `json:"latencyMs"`
-	LastUsed      time.Time `json:"lastUsed"`
-	FailCount     int     `json:"failCount"`
-	LastFailReason *string `json:"lastFailReason,omitempty"`
-	Status        string  `json:"status"`
+	URL            string    `json:"url"`
+	LatencyMs      int       `json:"latencyMs"`
+	LastUsed       time.Time `json:"lastUsed"`
+	FailCount      int       `json:"failCount"`
+	LastFailReason *string   `json:"lastFailReason,omitempty"`
+	Status         string    `json:"status"`
+}
+
+// ProbeFunc tests whether a proxy is usable and returns its latency in
+// milliseconds. A non-nil error marks the proxy as failed.
+type ProbeFunc func(proxyURL string) (latencyMs int, err error)
+
+// PoolOption customises a ProxyPool created by NewProxyPool.
+type PoolOption func(*ProxyPool)
+
+// WithMaxPool caps how many list entries one refresh probes and keeps.
+func WithMaxPool(maxPool int) PoolOption {
+	return func(p *ProxyPool) { p.MaxPool = maxPool }
+}
+
+// WithProbeConcurrency bounds how many proxies are probed simultaneously.
+func WithProbeConcurrency(concurrency int) PoolOption {
+	return func(p *ProxyPool) { p.ProbeConcurrency = concurrency }
 }
 
 type ProxyPool struct {
-	listURL         string
-	updateInterval  int
-	latencyTimeout  int
-	mu              sync.RWMutex
-	proxyCache      sync.Map
-	state           ProxyState
-	stopChan        chan struct{}
+	listURL        string
+	updateInterval int
+	latencyTimeout int
+	// singleProxy marks a pool built around one explicitly configured proxy.
+	// Such a pool has no refresh path (Start is never called), so MarkFailed
+	// must not remove that proxy from rotation.
+	singleProxy bool
+
+	// ProbeConcurrency bounds simultaneous probes during a refresh and MaxPool
+	// caps how many list entries are probed and kept. ProbeFn replaces the
+	// network probe so tests can stay offline; set these before Start or
+	// UpdatePool.
+	ProbeConcurrency int
+	MaxPool          int
+	ProbeFn          ProbeFunc
+
+	mu          sync.RWMutex
+	state       ProxyState
+	nextIndex   int // round-robin cursor into state.Proxies, guarded by mu
+	available   int // cached count of available proxies, guarded by mu
+	probeOffset int // rotating window start into the fetched list, guarded by mu
+	stopChan    chan struct{}
 }
 
-func NewProxyPool(listURL string, updateInterval int, latencyTimeout int) *ProxyPool {
+func newBaseProxyPool(latencyTimeout int) *ProxyPool {
 	return &ProxyPool{
-		listURL:        listURL,
-		updateInterval: updateInterval,
-		latencyTimeout: latencyTimeout,
-		stopChan:       make(chan struct{}),
-		state: ProxyState{
-			UpdateInterval: updateInterval,
-			LatencyTimeout: latencyTimeout,
-			Proxies:        []ProxyInfo{},
-		},
+		latencyTimeout:   latencyTimeout,
+		ProbeConcurrency: defaultProbeConcurrency,
+		MaxPool:          defaultMaxPool,
+		stopChan:         make(chan struct{}),
 	}
+}
+
+func NewProxyPool(listURL string, updateInterval int, latencyTimeout int, opts ...PoolOption) *ProxyPool {
+	pool := newBaseProxyPool(latencyTimeout)
+	pool.listURL = listURL
+	pool.updateInterval = updateInterval
+	pool.state = ProxyState{
+		UpdateInterval: updateInterval,
+		LatencyTimeout: latencyTimeout,
+		Proxies:        []ProxyInfo{},
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(pool)
+		}
+	}
+	if pool.MaxPool < 1 {
+		pool.MaxPool = defaultMaxPool
+	}
+	if pool.ProbeConcurrency < 1 {
+		pool.ProbeConcurrency = defaultProbeConcurrency
+	}
+	return pool
 }
 
 func NewSingleProxyPool(proxyURL string, latencyTimeout int) *ProxyPool {
 	latency := checkLatencyStatic(proxyURL, latencyTimeout)
-	return &ProxyPool{
-		latencyTimeout: latencyTimeout,
-		stopChan:       make(chan struct{}),
-		state: ProxyState{
-			UpdateInterval: 0,
-			LatencyTimeout: latencyTimeout,
-			Proxies: []ProxyInfo{
-				{
-					URL:       proxyURL,
-					LatencyMs: latency,
-					LastUsed:  time.Now(),
-					FailCount: 0,
-					Status:    "available",
-				},
+	pool := newBaseProxyPool(latencyTimeout)
+	pool.state = ProxyState{
+		UpdateInterval: 0,
+		LatencyTimeout: latencyTimeout,
+		Proxies: []ProxyInfo{
+			{
+				URL:       proxyURL,
+				LatencyMs: latency,
+				LastUsed:  time.Now(),
+				FailCount: 0,
+				Status:    statusAvailable,
 			},
 		},
 	}
+	pool.singleProxy = true
+	pool.available = 1
+	return pool
 }
 
 func NewEmptyProxyPool() *ProxyPool {
-	return &ProxyPool{
-		stopChan: make(chan struct{}),
-		state: ProxyState{
-			Proxies: []ProxyInfo{},
-		},
+	pool := newBaseProxyPool(0)
+	pool.state = ProxyState{
+		Proxies: []ProxyInfo{},
 	}
+	return pool
 }
 
+func (p *ProxyPool) probeTimeout() time.Duration {
+	seconds := p.latencyTimeout
+	if seconds <= 0 {
+		seconds = 3
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+// checkLatencyStatic probes a proxy once and falls back to the timeout value as
+// latency when the probe fails. Only single-proxy mode uses the fallback: an
+// explicitly configured proxy stays usable even if it is slow or down, while a
+// proxy discovered from the list is dropped when its probe fails.
 func checkLatencyStatic(proxyURL string, latencyTimeout int) int {
-	proxyFunc := func(_ *http.Request) (*url.URL, error) {
-		return url.Parse(proxyURL)
-	}
-
-	client := &http.Client{
-		Transport: &http.Transport{Proxy: proxyFunc},
-		Timeout:   time.Duration(latencyTimeout) * time.Second,
-	}
-
-	start := time.Now()
-	req, _ := http.NewRequest("HEAD", "https://www.google.com", nil)
-	resp, err := client.Do(req)
-	elapsed := time.Since(start)
-
+	latency, err := probeProxy(proxyURL, time.Duration(latencyTimeout)*time.Second)
 	if err != nil {
 		return latencyTimeout * 1000
 	}
-	resp.Body.Close()
-
-	if resp.StatusCode == 429 {
-		return latencyTimeout * 1000
-	}
-
-	return int(elapsed.Milliseconds())
+	return latency
 }
 
 func (p *ProxyPool) Start() {
@@ -134,116 +196,233 @@ func (p *ProxyPool) UpdatePool() {
 		return
 	}
 
-	var wg sync.WaitGroup
-	proxyChan := make(chan ProxyInfo, len(proxyList))
+	// Probe a bounded, rotating window of the list: one refresh never allocates
+	// more than MaxPool entries, so a huge upstream list cannot blow up memory,
+	// and successive refreshes sample different parts of it.
+	maxPool := p.maxPoolSize()
+	candidates := p.nextCandidateWindow(proxyList, maxPool)
 
-	for _, proxyURL := range proxyList {
+	// Fixed worker pool: goroutine count is bounded by the concurrency limit,
+	// and the results channel is pre-sized so nothing blocks on collection.
+	probeJobs := make(chan string)
+	results := make(chan ProxyInfo, len(candidates))
+	workers := min(p.probeConcurrencyLimit(), len(candidates))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func(url string) {
+		go func() {
 			defer wg.Done()
-			latency := p.checkLatency(url)
-			proxyChan <- ProxyInfo{
-				URL:       url,
-				LatencyMs: latency,
-				LastUsed:  time.Now(),
-				FailCount: 0,
-				Status:    "available",
+			for proxyURL := range probeJobs {
+				latency, err := p.checkLatency(proxyURL)
+				info := ProxyInfo{URL: proxyURL, LastUsed: time.Now()}
+				if err != nil {
+					reason := "probe failed: " + err.Error()
+					info.FailCount = 1
+					info.LastFailReason = &reason
+					info.Status = statusFailed
+				} else {
+					info.LatencyMs = latency
+					info.Status = statusAvailable
+				}
+				results <- info
 			}
-		}(proxyURL)
+		}()
 	}
+
+	go func() {
+		for _, proxyURL := range candidates {
+			probeJobs <- proxyURL
+		}
+		close(probeJobs)
+	}()
 
 	wg.Wait()
-	close(proxyChan)
+	close(results)
 
-	var proxies []ProxyInfo
-	for proxy := range proxyChan {
-		proxies = append(proxies, proxy)
+	proxies := make([]ProxyInfo, 0, len(candidates))
+	available := 0
+	for info := range results {
+		if info.Status == statusAvailable {
+			available++
+		}
+		proxies = append(proxies, info)
 	}
 
+	// Fastest available proxies first; failed probes sort last so they can
+	// never be handed out even if a caller ignores Status.
 	sort.Slice(proxies, func(i, j int) bool {
+		iAvailable := proxies[i].Status == statusAvailable
+		jAvailable := proxies[j].Status == statusAvailable
+		if iAvailable != jAvailable {
+			return iAvailable
+		}
 		return proxies[i].LatencyMs < proxies[j].LatencyMs
 	})
 
 	p.mu.Lock()
 	p.state.Proxies = proxies
 	p.state.LastUpdated = time.Now()
-	for _, proxy := range proxies {
-		p.proxyCache.Store(proxy.URL, proxy)
-	}
+	p.available = available
+	p.nextIndex = 0
 	p.mu.Unlock()
 }
 
+// nextCandidateWindow returns up to maxPool valid, de-duplicated proxy URLs
+// starting at a rotating offset in proxyList. The offset advances by one window
+// per refresh, so a dead or blocked head of a huge list cannot keep the pool
+// empty forever; it stays in memory because the window itself is bounded.
+func (p *ProxyPool) nextCandidateWindow(proxyList []string, maxPool int) []string {
+	candidates := make([]string, 0, min(len(proxyList), maxPool))
+	if len(proxyList) == 0 {
+		return candidates
+	}
+
+	window := min(maxPool, len(proxyList))
+	p.mu.Lock()
+	offset := p.probeOffset % len(proxyList)
+	p.probeOffset = (offset + window) % len(proxyList)
+	p.mu.Unlock()
+
+	// Dedupe within the window: one dead URL listed twice could otherwise stay
+	// "available" after MarkFailed demoted only its first occurrence.
+	seen := make(map[string]struct{}, window)
+	for i := 0; i < len(proxyList) && len(candidates) < maxPool; i++ {
+		proxyURL := proxyList[(offset+i)%len(proxyList)]
+		parsed, err := url.Parse(proxyURL)
+		if err != nil || parsed.Host == "" {
+			continue
+		}
+		if _, ok := seen[proxyURL]; ok {
+			continue
+		}
+		seen[proxyURL] = struct{}{}
+		candidates = append(candidates, proxyURL)
+	}
+
+	return candidates
+}
+
+func (p *ProxyPool) maxPoolSize() int {
+	if p.MaxPool > 0 {
+		return p.MaxPool
+	}
+	return defaultMaxPool
+}
+
+func (p *ProxyPool) probeConcurrencyLimit() int {
+	if p.ProbeConcurrency > 0 {
+		return p.ProbeConcurrency
+	}
+	return defaultProbeConcurrency
+}
+
 func (p *ProxyPool) fetchProxyList() ([]string, error) {
-	resp, err := http.Get(p.listURL)
+	client := &http.Client{Timeout: listFetchTimeout}
+	resp, err := client.Get(p.listURL)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
 
-	body, err := ioutil.ReadAll(resp.Body)
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return nil, fmt.Errorf("proxy list: unexpected status %d", resp.StatusCode)
+	}
+
+	// Read one byte past the limit so an oversized body is detected instead of
+	// silently truncated.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxProxyListBytes+1))
 	if err != nil {
 		return nil, err
 	}
-
-	lines := make([]string, 0)
-	start := 0
-	for i := 0; i < len(body); i++ {
-		if body[i] == '\n' {
-			line := string(body[start:i])
-			if len(line) > 0 {
-				lines = append(lines, line)
-			}
-			start = i + 1
-		}
+	if len(body) > maxProxyListBytes {
+		return nil, fmt.Errorf("proxy list exceeds %d bytes", maxProxyListBytes)
 	}
-	if start < len(body) {
-		line := string(body[start:])
-		if len(line) > 0 {
-			lines = append(lines, line)
+
+	lines := make([]string, 0, 256)
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
 		}
+		lines = append(lines, line)
 	}
 
 	return lines, nil
 }
 
-func (p *ProxyPool) checkLatency(proxyURL string) int {
-	proxy := func(_ *http.Request) (*url.URL, error) {
-		return url.Parse(proxyURL)
+// checkLatency runs the injected probe when set, otherwise a real network
+// probe. It reports a failure instead of inventing a latency, so UpdatePool can
+// mark the proxy as failed rather than advertising a dead proxy as available.
+func (p *ProxyPool) checkLatency(proxyURL string) (int, error) {
+	if p.ProbeFn != nil {
+		return p.ProbeFn(proxyURL)
+	}
+	return probeProxy(proxyURL, p.probeTimeout())
+}
+
+// probeProxy performs a one-shot HEAD request through proxyURL. The transport
+// disables keep-alives and is closed afterwards: a probe must not pin sockets
+// or TLS buffers for proxies that are never used.
+func probeProxy(proxyURL string, timeout time.Duration) (int, error) {
+	parsed, err := url.Parse(proxyURL)
+	if err != nil {
+		return 0, err
+	}
+	if parsed.Host == "" {
+		return 0, fmt.Errorf("proxy URL has no host")
 	}
 
-	client := &http.Client{
-		Transport: &http.Transport{Proxy: proxy},
-		Timeout:   time.Duration(p.latencyTimeout) * time.Second,
+	transport := &http.Transport{
+		Proxy:             func(*http.Request) (*url.URL, error) { return parsed, nil },
+		DisableKeepAlives: true,
+	}
+	defer transport.CloseIdleConnections()
+
+	client := &http.Client{Transport: transport, Timeout: timeout}
+	req, err := http.NewRequest(http.MethodHead, probeTargetURL, nil)
+	if err != nil {
+		return 0, err
 	}
 
 	start := time.Now()
-	req, _ := http.NewRequest("HEAD", "https://www.google.com", nil)
 	resp, err := client.Do(req)
 	elapsed := time.Since(start)
-
 	if err != nil {
-		return p.latencyTimeout * 1000
+		return 0, err
 	}
 	resp.Body.Close()
 
-	if resp.StatusCode == 429 {
-		return p.latencyTimeout * 1000
+	if resp.StatusCode == http.StatusTooManyRequests {
+		return 0, fmt.Errorf("probe target rate limited (429)")
 	}
 
-	return int(elapsed.Milliseconds())
+	return int(elapsed.Milliseconds()), nil
 }
 
+// GetNextProxy returns a copy of the next available proxy in round-robin order,
+// or nil when none is available. It updates LastUsed/TotalRequests under the
+// write lock, so callers never share mutable pool state.
 func (p *ProxyPool) GetNextProxy() *ProxyInfo {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
-	for i := range p.state.Proxies {
-		if p.state.Proxies[i].Status == "available" {
-			proxy := &p.state.Proxies[i]
-			proxy.LastUsed = time.Now()
-			p.state.TotalRequests++
-			return proxy
+	total := len(p.state.Proxies)
+	if p.available == 0 || total == 0 {
+		return nil
+	}
+
+	for i := 0; i < total; i++ {
+		index := (p.nextIndex + i) % total
+		if p.state.Proxies[index].Status != statusAvailable {
+			continue
 		}
+		p.nextIndex = (index + 1) % total
+		p.state.Proxies[index].LastUsed = time.Now()
+		p.state.TotalRequests++
+
+		info := p.state.Proxies[index]
+		return &info
 	}
 
 	return nil
@@ -255,22 +434,41 @@ func (p *ProxyPool) MarkFailed(proxyURL string, reason string) {
 
 	p.state.FailedRequests++
 
-	if proxy, ok := p.proxyCache.Load(proxyURL); ok {
-		pinfo := proxy.(ProxyInfo)
-		pinfo.FailCount++
-		pinfo.LastFailReason = &reason
-		pinfo.Status = "failed"
-		p.proxyCache.Store(proxyURL, pinfo)
-
-		for i := range p.state.Proxies {
-			if p.state.Proxies[i].URL == proxyURL {
-				p.state.Proxies[i].FailCount++
-				p.state.Proxies[i].LastFailReason = &reason
-				p.state.Proxies[i].Status = "failed"
-				break
-			}
+	for i := range p.state.Proxies {
+		if p.state.Proxies[i].URL != proxyURL {
+			continue
 		}
+		p.state.Proxies[i].FailCount++
+		p.state.Proxies[i].LastFailReason = &reason
+		// A single explicitly configured proxy has no refresh path to bring it
+		// back, so keep it available and let the next attempt retry it (HEAD
+		// behaviour). List-mode proxies are still demoted and replaced on the
+		// next refresh.
+		if p.singleProxy {
+			return
+		}
+		if p.state.Proxies[i].Status == statusAvailable {
+			p.available--
+		}
+		p.state.Proxies[i].Status = statusFailed
+		return
 	}
+}
+
+// AvailableCount reports how many proxies are currently usable. It is O(1) and
+// copies nothing, which makes it safe for hot paths such as the translation
+// retry loop.
+func (p *ProxyPool) AvailableCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.available
+}
+
+// ProxyCount reports how many proxies the pool holds, failed ones included.
+func (p *ProxyPool) ProxyCount() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return len(p.state.Proxies)
 }
 
 func (p *ProxyPool) GetState() ProxyState {
